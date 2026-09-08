@@ -9,6 +9,8 @@ creation (the code still exists server-side; the CLI/dashboard flows keep workin
 """
 from __future__ import annotations
 
+import os
+
 import httpx
 
 from .config import get_settings
@@ -43,7 +45,7 @@ async def _send(to: str, subject: str, html: str, text: str) -> bool:
     try:
         async with httpx.AsyncClient(timeout=15) as client:
             r = await client.post(
-                RESEND_URL,
+                os.getenv("TREG_EMAIL_API_URL", RESEND_URL),
                 headers={"Authorization": f"Bearer {s.resend_api_key}", "Content-Type": "application/json"},
                 json=payload,
             )
