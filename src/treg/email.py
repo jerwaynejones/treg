@@ -9,13 +9,9 @@ creation (the code still exists server-side; the CLI/dashboard flows keep workin
 """
 from __future__ import annotations
 
-import os
-
 import httpx
 
 from .config import get_settings
-
-RESEND_URL = "https://api.resend.com/emails"
 
 # ---- Monologue-skin email chrome (matches the landing page): charcoal ground, hardware
 # card, cyan accent, mono everywhere. Inline styles + solid fallbacks only (email-safe).
@@ -36,7 +32,7 @@ _WRAP = (
 
 
 async def _send(to: str, subject: str, html: str, text: str) -> bool:
-    """POST one email to Resend. Returns True on 2xx; never raises."""
+    """POST one transactional email. Returns True on 2xx; never raises."""
     s = get_settings()
     if not s.resend_api_key:
         print(f"[email] no TREG_RESEND_API_KEY — skipping send to {to} ({subject!r})")
@@ -45,12 +41,12 @@ async def _send(to: str, subject: str, html: str, text: str) -> bool:
     try:
         async with httpx.AsyncClient(timeout=15) as client:
             r = await client.post(
-                os.getenv("TREG_EMAIL_API_URL", RESEND_URL),
+                s.email_api_url,
                 headers={"Authorization": f"Bearer {s.resend_api_key}", "Content-Type": "application/json"},
                 json=payload,
             )
         if r.status_code >= 300:
-            print(f"[email] Resend {r.status_code} sending to {to}: {r.text[:200]}")
+            print(f"[email] provider {r.status_code} sending to {to}: {r.text[:200]}")
             return False
         return True
     except Exception as e:  # noqa: BLE001 — mail must never break the calling flow
@@ -77,12 +73,7 @@ async def send_invite(email: str, inviter: str, org_name: str, role: str, code: 
     then leads with what was shared and its button lands on that page after sign-in."""
     s = get_settings()
     from urllib.parse import quote
-    # The link should open on the SAME deployment the inviter was using. The request origin
-    # (link_base) captures that; public_url is the fallback for callers without a request.
     base = (link_base or s.public_url).rstrip("/")
-    # The link carries `email_token`, NOT `code`: the token exists only in this email, so clicking
-    # proves inbox access and /auth/invite-signin may sign the invitee in (POST-confirm, one-time).
-    # The visible code below stays the out-of-band credential the admin also holds — join-only.
     url = f"{base}/auth/invite-signin?t={quote(email_token)}"
     exp = f" It expires on {expires_at[:10]}." if expires_at else ""
     headline = (f'<b style="color:#f2efe8">{_esc(inviter)}</b> shared {_esc(shared)} with you — join <b style="color:#f2efe8">{_esc(org_name)}</b> to use it'
@@ -108,14 +99,8 @@ async def send_invite(email: str, inviter: str, org_name: str, role: str, code: 
 
 async def send_topup_receipt(email: str, org_name: str, amount_micro: int, balance_micro: int,
                              *, auto: bool = False, bonus_micro: int = 0) -> bool:
-    """Balance was added. Stripe emails its own payment receipt (the tax document); THIS email is the
-    one that says what the money became — how much call balance the team now has — which Stripe cannot
-    know. An automatic top-up says so plainly: an unattended charge nobody was told about is how a
-    chargeback starts."""
     added, left = _money(amount_micro), _money(balance_micro)
     how = "Auto top-up" if auto else "Top-up"
-    # The bonus is named next to the charge so the receipt and the balance agree: "$100 + $10 bonus"
-    # explains a balance that went up $110 on a $100 card charge, which otherwise reads as a mistake.
     bonus = f' <span style="color:#19D0E8">+ {_money(bonus_micro)} bonus</span>' if bonus_micro else ""
     lead = (f'Your balance dropped below your auto top-up threshold, so we charged your saved card '
             f'<b style="color:#f2efe8">{added}</b>.' if auto
@@ -139,33 +124,24 @@ async def send_topup_receipt(email: str, org_name: str, amount_micro: int, balan
 
 async def send_autotopup_disabled(email: str, org_name: str, reason: str,
                                   *, recovery_pi: bool = False) -> bool:
-    """Auto top-up turned itself off. Urgent by nature: the balance will now run out and every agent
-    call starts failing with a 402, so the email names the cause and the one action that fixes it."""
     why = {
-        "authentication_required": "your bank asked for verification (3-D Secure), which can't be done "
-                                   "while you're away from the keyboard",
+        "authentication_required": "your bank asked for verification (3-D Secure), which can't be done while you're away from the keyboard",
         "max_attempts": "the card was declined too many times in a row",
     }.get(reason.split(":")[0], f"of a payment problem ({_esc(reason)})")
-    fix = ("Open the dashboard and complete the payment once — your bank will remember the "
-           "verification for future charges." if recovery_pi
+    fix = ("Open the dashboard and complete the payment once — your bank will remember the verification for future charges." if recovery_pi
            else "Open the dashboard to update your card and switch auto top-up back on.")
     body = (
         '<p style="margin:0 0 6px;color:#f2efe8;font-size:16px;font-weight:600">Auto top-up is off</p>'
         f'<p style="margin:0 0 14px;color:#8e8c86;font-size:13px;line-height:1.6">We stopped topping up '
         f'<b style="color:#f2efe8">{_esc(org_name)}</b> because {why}.</p>'
-        f'<p style="margin:0 0 18px;color:#e4714a;font-size:13px;line-height:1.6">Once the balance runs out, '
-        'calls will start failing until it\'s funded.</p>'
+        f'<p style="margin:0 0 18px;color:#e4714a;font-size:13px;line-height:1.6">Once the balance runs out, calls will start failing until it\'s funded.</p>'
         f'<p style="margin:0;color:#8e8c86;font-size:13px;line-height:1.6">{fix}</p>'
     )
-    text = (f"Auto top-up for {org_name} is off because {reason}. Once the balance runs out, calls "
-            f"will fail until it's funded. {fix}")
-    return await _send(email, f"Action needed: auto top-up is off for {org_name}",
-                       _WRAP.format(body=body), text)
+    text = (f"Auto top-up for {org_name} is off because {reason}. Once the balance runs out, calls will fail until it's funded. {fix}")
+    return await _send(email, f"Action needed: auto top-up is off for {org_name}", _WRAP.format(body=body), text)
 
 
 def _money(amount_micro: int) -> str:
-    """micro-USD → a money string. Keeps four decimals under a dollar, because sub-cent amounts are
-    normal here (a catalog call runs ~$0.0006) and two decimals would print a real charge as $0.00."""
     try:
         v = int(amount_micro) / 1_000_000
     except (TypeError, ValueError):
