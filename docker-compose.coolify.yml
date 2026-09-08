@@ -1,16 +1,50 @@
 services:
+  init-secrets:
+    image: 'python:3.13-slim'
+    restart: 'no'
+    command:
+      - python
+      - '-c'
+      - |
+        import base64
+        import os
+        from pathlib import Path
+        import secrets
+
+        root = Path('/run/treg-secrets')
+        root.mkdir(parents=True, exist_ok=True)
+
+        def ensure(name, value):
+            path = root / name
+            if not path.exists():
+                path.write_text(value + '\n')
+                path.chmod(0o600)
+
+        ensure('treg_secret_key', base64.urlsafe_b64encode(os.urandom(32)).decode())
+        ensure('treg_session_secret', secrets.token_urlsafe(48))
+        ensure('treg_api_token', secrets.token_urlsafe(48))
+        ensure('postgres_password', secrets.token_urlsafe(32))
+    volumes:
+      - 'treg_secrets:/run/treg-secrets'
+
   treg:
     build:
       context: .
       dockerfile: Dockerfile
     restart: unless-stopped
+    command:
+      - /bin/sh
+      - '-c'
+      - |
+        export TREG_SECRET_KEY="$$(cat /run/treg-secrets/treg_secret_key)"
+        export TREG_SESSION_SECRET="$$(cat /run/treg-secrets/treg_session_secret)"
+        export TREG_API_TOKEN="$$(cat /run/treg-secrets/treg_api_token)"
+        POSTGRES_PASSWORD="$$(cat /run/treg-secrets/postgres_password)"
+        export TREG_DATABASE_URL="postgresql://treg:$${POSTGRES_PASSWORD}@postgres:5432/treg"
+        exec python -m treg
     environment:
       PORT: '18790'
-      TREG_DATABASE_URL: 'postgresql://treg:${SERVICE_PASSWORD_64_POSTGRES}@postgres:5432/treg'
       TREG_PUBLIC_URL: '${TREG_PUBLIC_URL}'
-      TREG_SECRET_KEY: '${TREG_SECRET_KEY}'
-      TREG_SESSION_SECRET: '${SERVICE_PASSWORD_64_TREGSESSION}'
-      TREG_API_TOKEN: '${SERVICE_PASSWORD_64_TREGAPI}'
       TREG_EMAIL_DEV_MODE: 'false'
       TREG_SINGLE_USER: 'false'
       TREG_GITHUB_CLIENT_ID: '${TREG_GITHUB_CLIENT_ID:-}'
@@ -21,8 +55,12 @@ services:
       TREG_RESEND_API_KEY: '${TREG_RESEND_API_KEY}'
       TREG_EMAIL_FROM: '${TREG_EMAIL_FROM}'
     depends_on:
+      init-secrets:
+        condition: service_completed_successfully
       postgres:
         condition: service_healthy
+    volumes:
+      - 'treg_secrets:/run/treg-secrets:ro'
     healthcheck:
       test:
         - CMD
@@ -42,9 +80,13 @@ services:
     environment:
       POSTGRES_DB: treg
       POSTGRES_USER: treg
-      POSTGRES_PASSWORD: '${SERVICE_PASSWORD_64_POSTGRES}'
+      POSTGRES_PASSWORD_FILE: '/run/treg-secrets/postgres_password'
+    depends_on:
+      init-secrets:
+        condition: service_completed_successfully
     volumes:
       - 'postgres_data:/var/lib/postgresql/data'
+      - 'treg_secrets:/run/treg-secrets:ro'
     healthcheck:
       test:
         - CMD-SHELL
@@ -72,6 +114,7 @@ services:
 
 volumes:
   postgres_data:
+  treg_secrets:
 
 networks:
   treg:
