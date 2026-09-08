@@ -3,6 +3,7 @@ from types import SimpleNamespace
 import pytest
 
 from treg import email as email_module
+from treg.config import Settings
 
 
 class _Response:
@@ -21,30 +22,32 @@ class _AsyncClient:
         return False
 
     async def post(self, url, **kwargs):
-        self.url = url
         _AsyncClient.last_url = url
         return _Response()
 
 
-@pytest.mark.parametrize(
-    ("configured", "expected"),
-    [
-        (None, email_module.RESEND_URL),
-        ("https://send.example.com/api/v1/emails", "https://send.example.com/api/v1/emails"),
-    ],
-)
-async def test_transactional_email_api_url_can_be_overridden(monkeypatch, configured, expected):
-    if configured is None:
-        monkeypatch.delenv("TREG_EMAIL_API_URL", raising=False)
-    else:
-        monkeypatch.setenv("TREG_EMAIL_API_URL", configured)
+def test_transactional_email_api_url_defaults_to_resend(monkeypatch):
+    monkeypatch.delenv("TREG_EMAIL_API_URL", raising=False)
+    assert Settings(_env_file=None).email_api_url == "https://api.resend.com/emails"
 
+
+def test_transactional_email_api_url_can_be_overridden(monkeypatch):
+    monkeypatch.setenv("TREG_EMAIL_API_URL", "https://send.example.com/api/v1/emails")
+    assert Settings(_env_file=None).email_api_url == "https://send.example.com/api/v1/emails"
+
+
+@pytest.mark.asyncio
+async def test_send_uses_configured_transactional_email_api_url(monkeypatch):
     monkeypatch.setattr(
         email_module,
         "get_settings",
-        lambda: SimpleNamespace(resend_api_key="test-key", email_from="treg@example.com"),
+        lambda: SimpleNamespace(
+            resend_api_key="test-key",
+            email_from="treg@example.com",
+            email_api_url="https://send.example.com/api/v1/emails",
+        ),
     )
     monkeypatch.setattr(email_module.httpx, "AsyncClient", _AsyncClient)
 
     assert await email_module._send("person@example.com", "subject", "<p>hello</p>", "hello")
-    assert _AsyncClient.last_url == expected
+    assert _AsyncClient.last_url == "https://send.example.com/api/v1/emails"
