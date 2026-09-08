@@ -1,0 +1,78 @@
+services:
+  treg:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    environment:
+      PORT: '18790'
+      TREG_DATABASE_URL: 'postgresql://treg:${POSTGRES_PASSWORD}@postgres:5432/treg'
+      TREG_PUBLIC_URL: '${TREG_PUBLIC_URL}'
+      TREG_SECRET_KEY: '${TREG_SECRET_KEY}'
+      TREG_SESSION_SECRET: '${TREG_SESSION_SECRET}'
+      TREG_API_TOKEN: '${TREG_API_TOKEN}'
+      TREG_EMAIL_DEV_MODE: 'false'
+      TREG_SINGLE_USER: 'false'
+      TREG_GITHUB_CLIENT_ID: '${TREG_GITHUB_CLIENT_ID:-}'
+      TREG_GITHUB_CLIENT_SECRET: '${TREG_GITHUB_CLIENT_SECRET:-}'
+      TREG_GOOGLE_CLIENT_ID: '${TREG_GOOGLE_CLIENT_ID:-}'
+      TREG_GOOGLE_CLIENT_SECRET: '${TREG_GOOGLE_CLIENT_SECRET:-}'
+      TREG_EMAIL_API_URL: 'https://unsend.staffgenix.ai/api/v1/emails'
+      TREG_RESEND_API_KEY: '${TREG_RESEND_API_KEY}'
+      TREG_EMAIL_FROM: 'GeekGenix <noreply@mailer.geekgenix.com>'
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - '-c'
+        - "import socket; s=socket.create_connection(('127.0.0.1', 18790), 2); s.close()"
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 60s
+    networks:
+      - treg
+
+  postgres:
+    image: 'postgres:17-alpine'
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: treg
+      POSTGRES_USER: treg
+      POSTGRES_PASSWORD: '${POSTGRES_PASSWORD}'
+    volumes:
+      - 'postgres_data:/var/lib/postgresql/data'
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - 'pg_isready -U treg -d treg'
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    networks:
+      - treg
+
+  cloudflared:
+    image: 'cloudflare/cloudflared:latest'
+    restart: unless-stopped
+    command:
+      - tunnel
+      - '--no-autoupdate'
+      - run
+      - '--token'
+      - '${CLOUDFLARE_TUNNEL_TOKEN}'
+    depends_on:
+      treg:
+        condition: service_healthy
+    networks:
+      - treg
+
+volumes:
+  postgres_data:
+
+networks:
+  treg:
+    driver: bridge
