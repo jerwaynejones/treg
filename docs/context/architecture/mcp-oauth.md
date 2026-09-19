@@ -4,11 +4,12 @@ status: shipped
 sources:
   - src/treg/application/auth.py
   - src/treg/mcp.py
-  - src/treg/mcp_feedback.py
-  - tests/test_mcp_feedback.py
   - src/treg/domain/identity/health.py
   - src/treg/domain/identity/mcp_oauth.py
   - src/treg/domain/identity/session.py
+  - src/treg/domain/identity/access.py
+  - src/treg/domain/identity/api_keys.py
+  - src/treg/routers/api_keys.py
   - src/treg/routers/auth.py
   - src/treg/web/claude-connector.html
   - src/treg/web/connect-demo.html
@@ -31,34 +32,22 @@ related:
 Both transports expose `feedback(category, message, call_ids?, endpoint_id?)`, using a four-value
 category enum and the shared HTTP intake. This is an additive, non-destructive write on treg,
 not an upstream call. It requires the existing transport identity and spends no balance.
-See [feedback](feedback.md). V2 retains its catalog-only calling boundary.
+Both also expose `review(call_id, usefulness, reason?)` as a non-destructive, non-idempotent local
+write relayed to `/reviews`, using the shared usefulness enum and description.
+See [feedback](feedback.md) for invitation sampling and hint priority. V2 retains its catalog-only calling boundary.
 
-## Optional feedback hint rollout
+## Managed bearer keys
 
-Both MCP call surfaces expose the API's `X-Treg-Call-Id` as optional `call_id`. Successful 2xx
-calls may also include a task-oriented `hint`; existing hints and idempotent replays take priority.
-The hint encourages proactive reporting of small annoyances and names concrete friction (guessing, workarounds, unexpected results or charges), welcomes
-reports even when the task succeeds, and names the feedback tool's `call_ids` argument explicitly.
-The provider `body` is unchanged. CLI and direct HTTP responses do not gain a feedback hint.
+Both `/mcp/` and `/mcp/v2/` accept an active managed key as a direct bearer. MCP tools pass that
+bearer to the normal API, so disable and revoke take effect on the next tool call. The transport can
+still list static tool schemas before it validates a non-OAuth bearer; this does not grant data or
+call access. A seven-day `scp=bootstrap` login token is not a team bearer and cannot call either MCP
+surface; `treg mcp install` rejects it before writing any client configuration. Use a team Default,
+Additional, or Agent key instead.
 
-`mcp_feedback` reads PostHog `/flags?v=2` with the existing `TREG_POSTHOG_KEY` and host. Configure
-boolean flag `mcp-feedback-hint`, enabled for fixed distinct ID `treg-mcp-feedback-hint` (100%
-rollout for that identity), with its enabled payload `{"sample_rate": 0.01}`. This is global
-configuration, not user targeting: **the payload controls per-call sampling**, not the PostHog
-rollout percentage. No new SDK or personal API key is required by the running service.
-
-One background poller is shared by both MCP lifespans, refreshes every 60 seconds with a 3-second
-request timeout, and is cancelled and awaited when the last transport stops. Calls only read the
-cache. Missing/disabled flags, invalid rates, fetch failures, and configuration older than 90 seconds
-disable hints. The payload accepts rates from 0 to 1; use 0 or disable the flag to stop the rollout.
-Changes apply after refresh without a deployment. A new deployment is required to install the code.
-
-Sampling hashes the call ID; when no reference exists it uses a fresh random identifier without
-inventing a public call reference. `mcp_feedback_hint_attached` is a best-effort analytics event
-containing surface, available call ID and the flag marker, never upstream content or credentials.
-It records a hint attached to a result, not proof that a client displayed it or an agent read it.
-Call references can associate reports with exposures; reports without references remain unattributed.
-This initial rollout does not maintain a session-level reminder cap.
+MCP OAuth access and refresh tokens remain typed, short-lived bridge credentials with separate V1
+and V2 audiences. They do not resolve through an `ApiKey` row and do not use a default-key control.
+This keeps OAuth refresh and audience isolation unchanged.
 
 ## Provider authorization remediation
 
@@ -236,6 +225,16 @@ Optional, and it is the caller's. Pass the same key when repeating a call whose 
 treg replays the stored response, does not reach the provider, and charges nothing, with
 `replayed: true` on the result.
 
+## `call` says when the overflow relay served it
+
+`/call/` discloses a relayed answer in `X-Treg-Served-Via`; an MCP client never sees headers, so
+`_call_impl` lifts it into `served_via` on the result with a one-line `hint` naming the relay and
+the exhausted provider (`cost_usd` is then the relay's real price, not the catalog's direct one).
+Both surfaces share the impl, so `/mcp/` and `/mcp/v2/` say it identically. `catalog_get` carries
+`overflow_price_usd` / `overflow_price_unit` / `overflow_via` for the same reason - the price to
+tell the human BEFORE the call includes the one the relay may bill (`architecture/money.md`
+§ Overflow money).
+
 It exists because the feature was built for agents and MCP is the agent path. Without it the whole
 thing was unreachable from the surface it was for.
 
@@ -272,14 +271,14 @@ server's own outbound validation refuse the whole catalog entry.
 
 ## Responses are gzip-compressed at the origin — the edge must find nothing to do
 
-Production sits behind Render's managed edge — no account or dashboard of ours — which
-Brotli-compresses large responses on the way out. At least one real client stack (httpx +
+The hosted service sits behind a managed edge which can Brotli-compress large responses on the way
+out. At least one real client stack (httpx +
 brotlicffi, issue #93) dies mid-decode on that output and then hangs to its own timeout, minutes
 after the upstream answered in seconds.
 
 The first fix was `Cache-Control: no-store, no-transform` (the `NoTransformResponses` wrapper,
 outermost so 401 challenges carry it too) — the origin's standard "do not re-encode" (RFC 9111).
-**Render's edge ignores it** (issue #100: `content-encoding: br` arrived in production right next to
+**The managed edge ignores it** (issue #100: `content-encoding: br` arrived in production next to
 the header). The header stays because it is correct and free, but the working fix is different: the
 MCP app gzips its own responses (`GZipMiddleware` inside `build_mcp_app`, ≥1KB). An edge only
 compresses what arrives uncompressed — a response already carrying `Content-Encoding: gzip` passes
@@ -408,11 +407,9 @@ happened before the balances were added.
 
 ### …but the choice must stay visible and reversible afterwards
 
-Decided-once became **invisible and permanent**, and that combination cost a user real money
-(2026-08-17). `balance` reported the slug `superdesign-7`; `treg org ls` on their machine listed
-`superdesign` and `ai-jason` and nothing else, because the CLI was signed in as a *different account*
-from the one that had clicked Allow. Nothing in the agent could tell a plausible slug from the wrong
-team, and the first signal was spend on a balance nobody had opened. Two halves to the fix:
+Decided-once became **invisible and permanent**, and that combination caused spend against the wrong
+team when the CLI and OAuth client used different identities. Nothing in the agent could tell a
+plausible slug from the intended team. Two halves to the fix:
 
 - **`balance` and `my_tools` label the grant**: `team_name` (a slug alone cannot be sanity-checked)
   and `identity` — the account the grant belongs to, which is usually the half that differs. If the
@@ -539,6 +536,12 @@ which makes it look like a provider outage rather than a setup problem. The garb
 the test suite's own dummy: `install_mcp(only=[])` read an empty list as "no filter" and wrote
 `Bearer K` into the developer's real configs on every suite run — `only=[]` now means *none*, and
 the test isolates HOME.
+
+Before that verification, the installer also recognizes the signed `scp=bootstrap` hint and exits
+without writes. The server remains authoritative—the local decode grants nothing—but this gives a
+clear setup error instead of installing a credential that cannot identify a billing team. MCP OAuth
+access/refresh flows are unchanged; their internal 120-second bridge identity remains a separate
+typed path.
 
 Why a header works even though treg advertises OAuth: a client only falls back to OAuth discovery on
 a **401**, and treg returns **200** for a valid header — verified against Claude Code, which

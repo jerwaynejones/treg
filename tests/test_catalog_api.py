@@ -11,11 +11,46 @@ from __future__ import annotations
 import dataclasses
 import json
 import re
+import shlex
 
 from httpx import AsyncClient
 
 from treg.domain.catalog import store as cs
 from treg import oauth_providers as P
+
+
+def test_openmart_surface_separates_platform_reads_from_byok_lifecycles():
+    cat = cs.load()
+    rows = cat.for_provider("openmart")
+    assert len(rows) == 16
+    assert len({(e["method"], e["path"]) for e in rows}) == 16
+    assert {e["id"] for e in rows if cat.platform_eligible(e)} == {
+        "openmart.businesses.search",
+        "openmart.businesses.lookup.openmart",
+        "openmart.businesses.lookup.google-place",
+        "openmart.companies.enrich",
+        "openmart.companies.search",
+    }
+    assert all(e.get("verified") and e.get("example_file") for e in rows)
+    assert cat.credit_rates["openmart"] == .0298
+    assert "openmart.account.balance" not in cat.by_id
+
+
+def test_openmart_pricing_and_lifecycle_boundaries_stay_visible():
+    cat = cs.load()
+    assert cat.by_id["openmart.people.find.batch"]["cost"]["value"] == 11
+    assert cat.by_id["openmart.technologies.find.batch"]["cost"]["value"] == 2
+    company_email = cat.by_id["openmart.companies.email.find.batch"]
+    assert company_email["cost"]["value"] == .3
+    assert company_email["cost"]["confidence"] == "documented"
+    fast = cat.by_id["openmart.businesses.search.ids"]
+    assert fast["cost"]["value"] is None and fast["cost"]["confidence"] == "unknown"
+    assert all(cat.by_id[key]["scope"] == "own_account" for key in (
+        "openmart.tasks.batch.status", "openmart.tasks.batch.ids", "openmart.tasks.get",
+        "openmart.deny-rules.create", "openmart.deny-rules.check",
+        "openmart.deny-rules.delete",
+    ))
+    assert cat.by_id["openmart.deny-rules.delete"]["cache"] == "forbidden"
 
 
 # ---- platform listing --------------------------------------------------------------------
@@ -616,6 +651,60 @@ async def test_unknown_endpoint_is_404(clients: AsyncClient):
     assert r.status_code == 404 and "tikhub.tiktok.nope" in r.text
 
 
+def test_hunter_multi_domain_search_uses_official_query_filters():
+    """Hunter Multi-Domain Search (Beta) rejects a JSON `companies` array with
+    `wrong_params` / `Unknown parameter: companies.` Official docs take company
+    and email filters as query parameters on POST (feedback #183)."""
+    cat = cs.load()
+    ep = cat.by_id["hunter.x.multi-domain-search"]
+    inp = ep.get("input") or {}
+    body = inp.get("body") or {}
+    query = inp.get("queryParams") or {}
+    test = ep.get("test_request") or {}
+
+    assert "companies" not in body
+    assert "companies" not in query
+    assert "companies" not in (test.get("body") or {})
+    assert "companies" not in (test.get("queryParams") or {})
+    assert "location" in query
+    assert "department" in query
+    assert "company_name" in query
+    assert query["location"].get("example") == "US"
+    assert test.get("queryParams", {}).get("location") == "US"
+    assert test.get("queryParams", {}).get("department") == "executive"
+    assert "body" not in test
+
+    tmpl = cs.call_template(ep)
+    assert tmpl.startswith("treg call hunter.x.multi-domain-search --method POST")
+    assert "--data" not in tmpl
+    assert "companies" not in tmpl
+    argv = shlex.split(tmpl)
+    queries = [argv[i + 1] for i, part in enumerate(argv) if part == "--query"]
+    assert "location=US" in queries
+    assert "department=executive" in queries
+
+
+def test_serpstat_jsonrpc_id_is_required_in_call_template():
+    """Serpstat rejects a JSON-RPC body without top-level `id`. `call_template` only
+    includes required body fields via `_required_examples`, so `id` must be required
+    on every Serpstat endpoint that declares it."""
+    cat = cs.load()
+    serpstat = [ep for ep in cat.endpoints if ep["provider"] == "serpstat"]
+    assert len(serpstat) >= 12, "every curated Serpstat endpoint is in play"
+    for ep in serpstat:
+        field = ((ep.get("input") or {}).get("body") or {}).get("id")
+        assert isinstance(field, dict), ep["id"]
+        assert field.get("required") is True, ep["id"]
+        assert field.get("example") == "1", ep["id"]
+
+    tmpl = cs.call_template(cat.by_id["serpstat.web.backlinks.summary"])
+    assert tmpl.startswith("treg call serpstat.web.backlinks.summary --method POST")
+    argv = shlex.split(tmpl)
+    data = json.loads(argv[argv.index("--data") + 1])
+    assert data["id"] == "1"
+    assert data["method"] == "SerpstatBacklinksProcedure.getSummaryV2"
+
+
 def test_call_template_falls_back_to_documented_examples(tmp_path):
     """No test_request (an unverified endpoint) still yields a usable line: required params only,
     valued by their documented example, or a typed placeholder when even that is missing."""
@@ -820,21 +909,36 @@ async def test_ai_generation_pages_keep_comparisons_curated_and_coverage_in_mode
     # the job-level rows return only when specific models are hand-picked into them.
     assert {section["domain"] for section in video["domains"]} == {"models"}
     rows = video["domains"][0]["rows"]
-    assert all(row["kind"] == "single" for row in rows)
+    # reAPI and PiAPI share per-model join keys on purpose, so the same model over two routes is
+    # the one merged row the wall is built for (a real comparison of price and filter policy).
+    shared = {"video-gen.seedance-2-5.generate", "video-gen.seedance-2-5-unrestricted.generate"}
+    assert {row["capability"] for row in rows if row["kind"] != "single"} == shared
+    providers = {row["capability"]: {e["provider"] for e in row["endpoints"]} for row in rows}
+    # the official OpenRouter route joins the default-filter row; only the resellers relax the filter
+    assert providers["video-gen.seedance-2-5.generate"] == {"reapi", "piapi", "openrouter"}
+    assert providers["video-gen.seedance-2-5-unrestricted.generate"] == {"reapi", "piapi"}
     caps = {row["capability"] for row in rows}
     assert "video-gen.from_text" not in caps and "video-gen.from_image" not in caps
     ids = {endpoint["id"] for row in rows for endpoint in row["endpoints"]}
     assert {"minimax.video-gen.from_text", "minimax.video-gen.from_image",
             "openrouter.video-gen.wan-3-0.from_text",
-            "replicate.video-gen.seedance-1-lite"} <= ids
+            "replicate.video-gen.seedance-1-lite",
+            "reapi.video-gen.seedance-2-5.unrestricted",
+            "piapi.video-gen.seedance-2-5.less-restriction"} <= ids
 
     image = (await clients.get("/catalog/platforms/image-gen")).json()
     assert {section["domain"] for section in image["domains"]} == {"models"}
     image_rows = [row for section in image["domains"] for row in section["rows"]]
-    assert all(row["kind"] == "single" for row in image_rows)
+    shared_images = {"image-gen.gpt-image-2-5.generate", "image-gen.gpt-image-2.generate",
+                     "image-gen.gemini-3-pro-image.generate"}
+    assert {row["capability"] for row in image_rows if row["kind"] != "single"} == shared_images
+    # every image model row compares the two resellers with Replicate's official model
+    assert all({e["provider"] for e in row["endpoints"]} == {"reapi", "piapi", "replicate"}
+               for row in image_rows if row["capability"] in shared_images)
     assert "image-gen.from_text" not in {row["capability"] for row in image_rows}
     image_ids = {endpoint["id"] for row in image_rows for endpoint in row["endpoints"]}
-    assert {"minimax.image-gen.from_text", "replicate.image-gen.flux-schnell"} <= image_ids
+    assert {"minimax.image-gen.from_text", "replicate.image-gen.flux-schnell",
+            "reapi.image-gen.gemini-3-pro-image", "piapi.image-gen.gpt-image-2-5"} <= image_ids
 
 
 def test_a_missing_catalog_directory_is_an_empty_catalog_not_a_crash(tmp_path):
@@ -1036,7 +1140,8 @@ def test_trial_pools_flow_from_fx_to_eligibility_and_display():
     from treg.domain.catalog import store as cs
 
     c = cs.load()
-    assert c.trial_pools == {"finnhub": 50, "twelvedata": 20, "tiingo": 20}
+    assert c.trial_pools == {"finnhub": 50, "twelvedata": 20, "tiingo": 20,
+                             "getleadsio": 5}
     ep = c.by_id["finnhub.quote"]
     assert c.platform_eligible(ep)
     cost = c.cost_view(ep["cost"], "finnhub")
@@ -1212,3 +1317,468 @@ async def test_search_caps_a_routed_group_at_a_few_children(clients: AsyncClient
     kids = [r for r in rows if r["capability"] == "people.search" and r.get("kind") != "routed"]
     assert len(kids) <= 5 and parent["children_hidden"] >= 1
     assert "treg.people.email.find" in {r["id"] for r in rows}, "the next job fits on the page now"
+
+
+async def test_enrichment_catalog_prices_and_routed_child_rates(clients):
+    from treg.domain.catalog import store
+    cat = store.load()
+    endpoints = [e for e in cat.by_id.values() if e['provider'] == 'quickenrich']
+    assert len(endpoints) == 11
+    assert sum(e['cost']['type'] == 'free' for e in endpoints) == 6
+    for ep in endpoints:
+        cost = cat.cost_view(ep['cost'], ep['provider'])
+        assert cost['usd'] == (0 if cost['type'] == 'free' else 0.004834)
+    for cap in ('people.email.find', 'people.phone.find', 'people.enrich', 'people.search', 'companies.search'):
+        response = await clients.get('/catalog/endpoints/treg.' + cap)
+        assert response.status_code == 200
+        doc = response.json()
+        children = [c for c in doc['routing']['plan'] if c['endpoint_id'].startswith('quickenrich.')]
+        assert children
+        for child in children:
+            ep = cat.by_id[child['endpoint_id']]
+            assert child['usd'] == cat.cost_view(ep['cost'], ep['provider'])['usd']
+
+
+def test_generic_display_prices_match_web_and_cli():
+    from treg.domain.catalog import store
+    from treg.routers.web import _price_label
+    from treg.cli import _cost_usd, _cost_label
+    cat = store.load()
+    for quantity, rate in [(25, 2.0), (100, 1.0)]:
+        raw = {'type': 'per_result', 'currency': 'USD', 'value': rate, 'per': quantity,
+               'display': {'unit': 'records', 'grouped': True, 'round_up': True}}
+        cost = cat.cost_view(raw, 'any-provider')
+        expected = f'${rate:g}/started {quantity} records'
+        assert cost['usd'] == rate / quantity
+        assert _price_label(cost) == _cost_usd(cost) == _cost_label(cost) == expected
+    cost = cat.cost_view({'type': 'per_result', 'currency': 'USD', 'value': 2,
+                         'display': {'unit': 'item', 'variable': True}}, 'another-provider')
+    assert _price_label(cost) == _cost_usd(cost) == _cost_label(cost) == '$2+/item'
+
+
+def test_hunter_domain_search_advertises_one_search_credit():
+    """Feedback #201: live Domain Search bills 1 SEARCH credit (~$0.0245) even for one email.
+
+    `value`/`per`/`note` stay 1 credit per 10 emails — `usd` is still that linear slice so
+    reserve can scale with `limit`. catalog_get / usd_per_call must quote the whole credit,
+    which is what `display.grouped` + `advertised_usd` do. Settlement is unchanged.
+    """
+    cat = cs.load()
+    raw = cat.by_id["hunter.companies.emails"]["cost"]
+    assert (raw["value"], raw["per"], raw["unit"]) == (1, 10, "record")
+    cost = cat.cost_view(raw, "hunter")
+    assert cost["usd"] == 0.00245
+    assert cost["display_usd"] == 0.0245
+    assert cost["display_unit"] == "started 10 emails"
+    assert cat.advertised_usd(cost) == 0.0245
+    # Sibling Finder and Multi-Domain reveal already quote one full search credit.
+    find = cat.cost_view(cat.by_id["hunter.people.email.find"]["cost"], "hunter")
+    assert find["usd"] == 0.0245 and cat.advertised_usd(find) == 0.0245
+    reveal = cat.cost_view(cat.by_id["hunter.x.multi-domain-search-reveal"]["cost"], "hunter")
+    assert reveal["usd"] == 0.0245 and cat.advertised_usd(reveal) == 0.0245
+
+
+def test_dataforseo_related_keywords_does_not_advertise_order_by():
+    """Feedback #54 / #439: live related_keywords/live rejects order_by and
+    filters with 40501.
+
+    Vendor docs still list both fields; the live API does not. catalog_get must
+    not offer them on this id. ranked_keywords (a sibling Labs route) still
+    sorts and filters.
+    """
+    cat = cs.load()
+    ideas = cat.by_id["dataforseo.google.keywords.ideas"]
+    assert ideas["path"] == "/dataforseo_labs/google/related_keywords/live"
+    body = ideas["input"]["body"]
+    assert "order_by" not in body
+    assert "filters" not in body
+    note = ideas["input"]["note"]
+    assert "order_by" in note
+    assert "filters" in note
+    ranked = cat.by_id["dataforseo.google.domain.ranked_keywords"]
+    assert "order_by" in ranked["input"]["body"]
+    assert "filters" in ranked["input"]["body"]
+    for task in ideas["test_request"]["body"]:
+        assert "order_by" not in task
+        assert "filters" not in task
+
+
+async def test_catalog_get_dataforseo_related_keywords_omits_order_by(clients: AsyncClient):
+    body = (await clients.get("/catalog/endpoints/dataforseo.google.keywords.ideas")).json()
+    assert "order_by" not in body["endpoint"]["input"]["body"]
+    assert "filters" not in body["endpoint"]["input"]["body"]
+    note = body["endpoint"]["input"]["note"]
+    assert "order_by" in note
+    assert "filters" in note
+
+
+async def test_catalog_get_dataforseo_maps_live_omits_location_name(clients: AsyncClient):
+    body = (await clients.get(
+        "/catalog/endpoints/dataforseo.x.serp-google-maps-live-advanced"
+    )).json()
+    fields = body["endpoint"]["input"]["body"]
+    assert "location_name" not in fields
+    assert "location_code" in fields
+    assert "location_coordinate" in fields
+    note = body["endpoint"]["input"]["note"]
+    assert "location_name" in note
+    assert "40501" in note
+
+
+def test_dataforseo_backlinks_summary_is_single_task():
+    """Feedback #102 / #103: backlinks/summary/live accepts exactly one task.
+
+    catalog_get used to reuse the generic "array of task objects" wording (and
+    the provider-level "up to 100 tasks" limit), so agents batched domains and
+    got per-task 40000 "You can set only one task at a time" on the rest.
+    Vendor docs: each Live API call can contain only one task. Multi-target
+    work is dataforseo.web.url.metrics (bulk_ranks/live, many targets / one task).
+    """
+    cat = cs.load()
+    ep = cat.by_id["dataforseo.web.backlinks.summary"]
+    assert ep["path"] == "/backlinks/summary/live"
+    note = ep["input"]["note"]
+    assert "exactly one task" in note
+    assert "40000" in note
+    assert "dataforseo.web.url.metrics" in note
+    tasks = ep["test_request"]["body"]
+    assert isinstance(tasks, list) and len(tasks) == 1
+    limits = cat.provider_meta["dataforseo"]["limits"]
+    assert "exactly one task" in limits
+    assert "up to 100 tasks per POST array" not in limits
+
+
+async def test_catalog_get_dataforseo_backlinks_summary_names_the_single_task_limit(
+        clients: AsyncClient):
+    body = (await clients.get("/catalog/endpoints/dataforseo.web.backlinks.summary")).json()
+    note = body["endpoint"]["input"]["note"]
+    assert "exactly one task" in note
+    assert "40000" in note
+    assert "dataforseo.web.url.metrics" in note
+    assert "up to 100 tasks per POST array" not in body["provider"]["limits"]
+    assert "exactly one task" in body["provider"]["limits"]
+    tmpl = body["call_template"]
+    assert tmpl.startswith("treg call dataforseo.web.backlinks.summary --method POST")
+    assert "--data '[{\"target\":\"moz.com\"" in tmpl
+
+
+async def test_catalog_get_dataforseo_ai_mode_live_names_the_single_task_limit(
+        clients: AsyncClient):
+    """Feedback #94: catalog_get must not advertise multi-task batching on this Live route."""
+    body = (await clients.get(
+        "/catalog/endpoints/dataforseo.x.serp-google-ai-mode-live-advanced")).json()
+    note = body["endpoint"]["input"]["note"]
+    assert "exactly one task" in note.lower() or "exactly 1 task" in note.lower()
+    assert "40000" in note
+    assert "one object per task" not in note.lower()
+    tmpl = body["call_template"]
+    assert tmpl.startswith(
+        "treg call dataforseo.x.serp-google-ai-mode-live-advanced --method POST")
+
+
+async def test_catalog_get_dataforseo_claude_llm_responses_live_names_working_model(
+        clients: AsyncClient):
+    """Feedback #358: catalog_get must not advertise claude-opus-4-0 or multi-task batching."""
+    body = (await clients.get(
+        "/catalog/endpoints/dataforseo.x.ai-optimization-claude-llm-responses-live")).json()
+    fields = body["endpoint"]["input"]["body"]
+    assert fields["model_name"]["example"] == "claude-sonnet-4-5"
+    model_note = fields["model_name"]["note"]
+    assert "40501" in model_note or "llm_responses/models" in model_note
+    note = body["endpoint"]["input"]["note"]
+    assert "exactly one task" in note.lower() or "exactly 1 task" in note.lower()
+    assert "40000" in note
+    assert "one object per task" not in note.lower()
+    example = body.get("example_response")
+    if isinstance(example, dict):
+        tasks = example.get("tasks") or []
+        assert not tasks or tasks[0].get("status_code") != 40501, (
+            "catalog_get must not advertise the 40501 Invalid Field failure as the example"
+        )
+
+
+async def test_catalog_get_dataforseo_page_audit_names_browser_preset_dependency(
+        clients: AsyncClient):
+    """Feedback #234 / #235: catalog_get must not advertise browser_preset alone."""
+    body = (await clients.get("/catalog/endpoints/dataforseo.web.page.audit")).json()
+    fields = body["endpoint"]["input"]["body"]
+    assert "enable_browser_rendering=true" in fields["browser_preset"]["note"]
+    assert "40501" in fields["browser_preset"]["note"]
+    assert "browser_preset" in fields["enable_browser_rendering"]["note"]
+    assert "browser_preset" in body["endpoint"]["input"]["note"]
+    assert "enable_browser_rendering" in body["endpoint"]["input"]["note"]
+
+
+async def test_catalog_get_hunter_domain_search_quotes_the_credit(clients: AsyncClient):
+    body = (await clients.get("/catalog/endpoints/hunter.companies.emails")).json()
+    cost = body["endpoint"]["cost"]
+    assert cost["usd"] == 0.00245, "reserve unit stays the per-record slice"
+    assert cost["display_usd"] == 0.0245
+    assert cost["display_unit"] == "started 10 emails"
+    search = (await clients.get("/catalog/search", params={"q": "hunter domain search emails", "limit": 50})).json()
+    row = next(r for r in search["results"] if r["id"] == "hunter.companies.emails")
+    assert row["cost"]["display_usd"] == 0.0245
+    assert row["cost"]["usd"] == 0.00245
+
+
+INSTAGRAM_REELS_SEARCH_ID = "scrapecreators.x.v2-instagram-reels-search"
+INSTAGRAM_REELS_DATE_POSTED = ["last-week", "last-month", "last-year"]
+
+
+def test_scrapecreators_instagram_reels_search_date_posted_enum():
+    """Feedback #381: GET /v2/instagram/reels/search only accepts week/month/year windows.
+
+    catalog_get used to advertise example last-hour (Google's generic date_posted
+    set). Upstream OpenAPI enum is last-week | last-month | last-year; hour/day
+    windows are unsupported because Google does not index Instagram reels
+    reliably there. Sibling scrapecreators date_posted fields keep their own
+    windows. Settlement is unchanged.
+
+    Ref: https://docs.scrapecreators.com/openapi.json
+    """
+    cat = cs.load()
+    ep = cat.by_id[INSTAGRAM_REELS_SEARCH_ID]
+    assert ep["path"] == "/v2/instagram/reels/search"
+    field = ep["input"]["queryParams"]["date_posted"]
+    assert field["enum"] == INSTAGRAM_REELS_DATE_POSTED
+    assert field["example"] == "last-week"
+    note = field["note"].lower()
+    assert "hour" in note and "day" in note
+    assert "not supported" in note or "unsupported" in note
+
+    google = cat.by_id["scrapecreators.x.v1-google-search"]["input"]["queryParams"]["date_posted"]
+    assert google.get("enum") is None
+    assert google["example"] == "last-hour"
+    linkedin = cat.by_id["scrapecreators.x.v1-linkedin-search-posts"]["input"]["queryParams"]["date_posted"]
+    assert linkedin.get("enum") is None
+
+
+async def test_catalog_get_scrapecreators_instagram_reels_search_date_posted(
+        clients: AsyncClient):
+    """Feedback #381: catalog_get must not advertise last-hour on this reels search."""
+    body = (await clients.get(f"/catalog/endpoints/{INSTAGRAM_REELS_SEARCH_ID}")).json()
+    field = body["endpoint"]["input"]["queryParams"]["date_posted"]
+    assert field["enum"] == INSTAGRAM_REELS_DATE_POSTED
+    assert field["example"] == "last-week"
+    note = field["note"].lower()
+    assert "hour" in note and "day" in note
+    assert "not supported" in note or "unsupported" in note
+
+
+LLM_MENTIONS_HISTORICAL_ID = "dataforseo.x.ai-optimization-llm-mentions-historical-live"
+LLM_MENTIONS_MULTI_TARGET_ID = (
+    "dataforseo.x.ai-optimization-llm-mentions-multi-target-metrics-live"
+)
+
+
+def test_dataforseo_llm_mentions_historical_target_is_and_combined():
+    """Feedback #218: historical-live `target` is one AND-combined filter.
+
+    catalog_get used to advertise "up to 10 entities" without AND semantics, so
+    agents sent many brands in one call expecting multiple series. Upstream
+    AND-combines include/exclude entities into one metrics series. Brand
+    comparison is multi-target-metrics-live (`targets` with keys) or one call
+    per brand. The wikipedia+bmw example stays a filter combo.
+    """
+    cat = cs.load()
+    ep = cat.by_id[LLM_MENTIONS_HISTORICAL_ID]
+    assert ep["path"] == "/ai_optimization/llm_mentions/historical/live"
+    note = ep["input"]["body"]["target"]["note"]
+    assert "AND-combined" in note
+    assert "one metrics series" in note or "one series" in note
+    assert LLM_MENTIONS_MULTI_TARGET_ID in note
+    example = ep["input"]["body"]["target"]["example"]
+    assert example[0]["domain"] == "en.wikipedia.org"
+    assert example[0]["search_filter"] == "exclude"
+    assert example[1]["keyword"] == "bmw"
+    tasks = ep["test_request"]["body"]
+    assert isinstance(tasks, list) and len(tasks) == 1
+    assert tasks[0]["target"][0]["domain"] == "en.wikipedia.org"
+    assert tasks[0]["target"][1]["keyword"] == "bmw"
+    multi = cat.by_id[LLM_MENTIONS_MULTI_TARGET_ID]
+    assert "targets" in multi["input"]["body"]
+    assert "target" not in multi["input"]["body"]
+
+
+async def test_catalog_get_dataforseo_llm_mentions_historical_names_and_semantics(
+        clients: AsyncClient):
+    """Feedback #218: catalog_get must not advertise multi-series `target`."""
+    body = (await clients.get(f"/catalog/endpoints/{LLM_MENTIONS_HISTORICAL_ID}")).json()
+    note = body["endpoint"]["input"]["body"]["target"]["note"]
+    assert "AND-combined" in note
+    assert "one metrics series" in note or "one series" in note
+    assert LLM_MENTIONS_MULTI_TARGET_ID in note
+    tmpl = body["call_template"]
+    assert tmpl.startswith(
+        f"treg call {LLM_MENTIONS_HISTORICAL_ID} --method POST")
+    assert "en.wikipedia.org" in tmpl
+    assert "exclude" in tmpl
+    assert "bmw" in tmpl
+
+
+async def test_catalog_get_dataforseo_llm_mentions_multi_target_names_targets_bound(
+        clients: AsyncClient):
+    """Feedback #490: catalog_get must name the 2-10 / 40501 targets bound."""
+    body = (await clients.get(f"/catalog/endpoints/{LLM_MENTIONS_MULTI_TARGET_ID}")).json()
+    field = body["endpoint"]["input"]["body"]["targets"]
+    assert field.get("required") is False
+    note = field["note"]
+    lower = note.lower()
+    assert "required" in lower
+    assert "2" in note and "10" in note
+    assert "40501" in note
+    assert LLM_MENTIONS_HISTORICAL_ID in note
+    example = field["example"]
+    assert len(example) == 4
+    assert [item["key"] for item in example] == [
+        "chat_gpt", "claude", "gemini", "perplexity"
+    ]
+    tmpl = body["call_template"]
+    assert tmpl.startswith(
+        f"treg call {LLM_MENTIONS_MULTI_TARGET_ID} --method POST")
+    assert "chat_gpt" in tmpl
+    assert "perplexity" in tmpl
+
+
+def test_dataforseo_llm_mentions_platform_omitted_is_google_only():
+    """Feedback #489: historical + multi-target `platform` omit is google only.
+
+    catalog_get used to advertise both default google and "returned for both
+    platforms". Live omit matches platform=google; chat_gpt is a different
+    series. Settlement is unchanged.
+    """
+    cat = cs.load()
+    for endpoint_id in (LLM_MENTIONS_HISTORICAL_ID, LLM_MENTIONS_MULTI_TARGET_ID):
+        ep = cat.by_id[endpoint_id]
+        field = ep["input"]["body"]["platform"]
+        assert field.get("required") is False
+        note = field["note"].lower()
+        assert "optional" in note
+        assert "chat_gpt" in note and "google" in note
+        assert "defaults to google" in note
+        assert "not both platforms" in note
+        assert "returned for both" not in note
+        assert "united states" in note and "english" in note
+        assert field["example"] == "google"
+
+
+async def test_catalog_get_dataforseo_llm_mentions_platform_omitted_is_google_only(
+        clients: AsyncClient):
+    """Feedback #489: catalog_get must not say omit returns both platforms."""
+    for endpoint_id in (LLM_MENTIONS_HISTORICAL_ID, LLM_MENTIONS_MULTI_TARGET_ID):
+        body = (await clients.get(f"/catalog/endpoints/{endpoint_id}")).json()
+        field = body["endpoint"]["input"]["body"]["platform"]
+        note = field["note"].lower()
+        assert "defaults to google" in note
+        assert "not both platforms" in note
+        assert "returned for both" not in note
+        assert field["example"] == "google"
+
+
+GOOGLE_TRENDS_ID = "serpapi.x.google-trends"
+
+
+def test_serpapi_google_trends_data_type_names_geo_map_cardinality():
+    """Feedback #440: GEO_MAP is compared regional breakdown (multiple queries);
+    GEO_MAP_0 is interest by region (single query).
+
+    catalog_get used to list TIMESERIES | GEO_MAP | GEO_MAP_0 | RELATED_TOPICS |
+    RELATED_QUERIES with no cardinality, so agents sent GEO_MAP with one keyword
+    and got HTTP 400. Settlement is unchanged.
+
+    Ref: https://serpapi.com/google-trends-api
+    """
+    cat = cs.load()
+    ep = cat.by_id[GOOGLE_TRENDS_ID]
+    assert ep["path"] == "/search"
+    note = ep["input"]["queryParams"]["data_type"]["note"].lower()
+    assert "geo_map" in note
+    assert "multiple" in note
+    assert "compar" in note
+    assert "geo_map_0" in note
+    assert "single" in note
+    assert "timeseries" in note
+    assert "related_topics" in note
+    assert "related_queries" in note
+
+
+async def test_catalog_get_serpapi_google_trends_data_type_cardinality(
+        clients: AsyncClient):
+    """Feedback #440: catalog_get must warn GEO_MAP needs multiple queries."""
+    body = (await clients.get(f"/catalog/endpoints/{GOOGLE_TRENDS_ID}")).json()
+    note = body["endpoint"]["input"]["queryParams"]["data_type"]["note"].lower()
+    assert "geo_map" in note
+    assert "multiple" in note
+    assert "compar" in note
+    assert "geo_map_0" in note
+    assert "single" in note
+    assert "timeseries" in note
+    assert "related_topics" in note
+    assert "related_queries" in note
+
+
+GOOGLE_MAPS_ID = "serpapi.x.google-maps"
+
+
+def test_serpapi_google_maps_documents_place_id():
+    """Feedback #525: Google place_id NAP lookup was undocumented.
+
+    catalog_get listed only engine/type/q/ll/start, so a place_id-only call
+    returned Treg 400 requiring type and q. Upstream accepts place_id without
+    other optional params (https://serpapi.com/google-maps-api); Treg schema
+    validation still requires type and q. Catalog-only: document optional
+    place_id and keep type/q required. Settlement is unchanged.
+    """
+    cat = cs.load()
+    ep = cat.by_id[GOOGLE_MAPS_ID]
+    assert ep["path"] == "/search"
+    params = ep["input"]["queryParams"]
+    assert params["engine"]["required"] is True
+    assert params["type"]["required"] is True
+    assert params["q"]["required"] is True
+    place = params["place_id"]
+    assert place["type"] == "string"
+    assert place.get("required") is False
+    note = place["note"].lower()
+    assert "place_id" in note
+    assert "nap" in note or ("name" in note and "address" in note and "phone" in note)
+    assert "type=place" in note
+    assert "https://serpapi.com/google-maps-api" in place["note"]
+    assert "type" in note and "q" in note
+    type_note = params["type"]["note"].lower()
+    assert "place_id" in type_note
+    assert "search" in type_note and "place" in type_note
+    q_note = params["q"]["note"].lower()
+    assert "place_id" in q_note
+    assert "search" in q_note
+    input_note = ep["input"]["note"].lower()
+    assert "place_results" in input_note
+    assert "local_results" in input_note
+    assert "place_id" in input_note
+    test = ep["test_request"]["queryParams"]
+    assert test == {
+        "engine": "google_maps",
+        "type": "search",
+        "q": "pizza",
+        "ll": "@40.7455096,-74.0083012,14z",
+    }
+
+
+async def test_catalog_get_serpapi_google_maps_place_id(clients: AsyncClient):
+    """Feedback #525: catalog_get must document place_id for NAP lookup."""
+    body = (await clients.get(f"/catalog/endpoints/{GOOGLE_MAPS_ID}")).json()
+    params = body["endpoint"]["input"]["queryParams"]
+    assert params["type"]["required"] is True
+    assert params["q"]["required"] is True
+    place = params["place_id"]
+    assert place["type"] == "string"
+    assert place.get("required") is False
+    note = place["note"].lower()
+    assert "place_id" in note
+    assert "type=place" in note
+    assert "https://serpapi.com/google-maps-api" in place["note"]
+    tmpl = body["call_template"]
+    assert tmpl.startswith(f"treg call {GOOGLE_MAPS_ID}")
+    assert "type=search" in tmpl
+    assert "q=pizza" in tmpl
+    assert "place_id=" not in tmpl

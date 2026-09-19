@@ -288,6 +288,40 @@
   {
     "kind": "APIRoute",
     "methods": [
+      "POST"
+    ],
+    "name": "submit_review",
+    "path": "/reviews"
+  },
+  {
+    "kind": "APIRoute",
+    "methods": [
+      "GET",
+      "HEAD"
+    ],
+    "name": "admin_reviews",
+    "path": "/admin/reviews"
+  },
+  {
+    "kind": "APIRoute",
+    "methods": [
+      "POST"
+    ],
+    "name": "host_media",
+    "path": "/media"
+  },
+  {
+    "kind": "APIRoute",
+    "methods": [
+      "GET",
+      "HEAD"
+    ],
+    "name": "serve_media",
+    "path": "/m/{token}"
+  },
+  {
+    "kind": "APIRoute",
+    "methods": [
       "GET",
       "HEAD"
     ],
@@ -591,6 +625,15 @@
       "GET",
       "HEAD"
     ],
+    "name": "make_ugc_skill_md",
+    "path": "/skills/ugc/SKILL.md"
+  },
+  {
+    "kind": "APIRoute",
+    "methods": [
+      "GET",
+      "HEAD"
+    ],
     "name": "feedback_md",
     "path": "/feedback.md"
   },
@@ -663,6 +706,15 @@
       "GET",
       "HEAD"
     ],
+    "name": "agent_setup_js",
+    "path": "/agent-setup.js"
+  },
+  {
+    "kind": "APIRoute",
+    "methods": [
+      "GET",
+      "HEAD"
+    ],
     "name": "adtrack_js",
     "path": "/adtrack.js"
   },
@@ -726,8 +778,35 @@
       "GET",
       "HEAD"
     ],
+    "name": "ugc_page",
+    "path": "/ugc"
+  },
+  {
+    "kind": "APIRoute",
+    "methods": [
+      "GET",
+      "HEAD"
+    ],
     "name": "people_search_page",
     "path": "/people-search"
+  },
+  {
+    "kind": "APIRoute",
+    "methods": [
+      "GET",
+      "HEAD"
+    ],
+    "name": "blog_index",
+    "path": "/blog"
+  },
+  {
+    "kind": "APIRoute",
+    "methods": [
+      "GET",
+      "HEAD"
+    ],
+    "name": "blog_people_search_bench",
+    "path": "/blog/people-search-bench"
   },
   {
     "kind": "APIRoute",
@@ -850,6 +929,15 @@
     ],
     "name": "well_known_skill_md",
     "path": "/.well-known/skills/treg/SKILL.md"
+  },
+  {
+    "kind": "APIRoute",
+    "methods": [
+      "GET",
+      "HEAD"
+    ],
+    "name": "well_known_make_ugc_md",
+    "path": "/.well-known/skills/make-ugc/SKILL.md"
   },
   {
     "kind": "APIRoute",
@@ -1187,6 +1275,14 @@
   {
     "kind": "APIRoute",
     "methods": [
+      "PATCH"
+    ],
+    "name": "rename_org",
+    "path": "/orgs/{org_id}"
+  },
+  {
+    "kind": "APIRoute",
+    "methods": [
       "GET",
       "HEAD"
     ],
@@ -1415,6 +1511,80 @@
     ],
     "name": "revoke_agent",
     "path": "/orgs/{org_id}/agents/{user_id}"
+  },
+  {
+    "kind": "APIRoute",
+    "methods": [
+      "GET",
+      "HEAD"
+    ],
+    "name": "list_api_keys",
+    "path": "/orgs/{org_id}/api-keys"
+  },
+  {
+    "kind": "APIRoute",
+    "methods": [
+      "POST"
+    ],
+    "name": "create_api_key",
+    "path": "/orgs/{org_id}/api-keys"
+  },
+  {
+    "kind": "APIRoute",
+    "methods": [
+      "PATCH"
+    ],
+    "name": "rename_api_key",
+    "path": "/orgs/{org_id}/api-keys/{key_id}"
+  },
+  {
+    "kind": "APIRoute",
+    "methods": [
+      "POST"
+    ],
+    "name": "disable_api_key",
+    "path": "/orgs/{org_id}/api-keys/{key_id}/disable"
+  },
+  {
+    "kind": "APIRoute",
+    "methods": [
+      "POST"
+    ],
+    "name": "enable_api_key",
+    "path": "/orgs/{org_id}/api-keys/{key_id}/enable"
+  },
+  {
+    "kind": "APIRoute",
+    "methods": [
+      "POST"
+    ],
+    "name": "revoke_api_key",
+    "path": "/orgs/{org_id}/api-keys/{key_id}/revoke"
+  },
+  {
+    "kind": "APIRoute",
+    "methods": [
+      "POST"
+    ],
+    "name": "rotate_api_key",
+    "path": "/orgs/{org_id}/api-keys/{key_id}/rotate"
+  },
+  {
+    "kind": "APIRoute",
+    "methods": [
+      "POST"
+    ],
+    "name": "hide_api_key",
+    "path": "/orgs/{org_id}/api-keys/{key_id}/hide"
+  },
+  {
+    "kind": "APIRoute",
+    "methods": [
+      "GET",
+      "HEAD"
+    ],
+    "name": "list_api_key_events",
+    "path": "/orgs/{org_id}/api-keys/{key_id}/events"
   },
   {
     "kind": "APIRoute",
@@ -1871,6 +2041,15 @@
   {
     "kind": "APIRoute",
     "methods": [
+      "GET",
+      "HEAD"
+    ],
+    "name": "admin_kv",
+    "path": "/admin/kv"
+  },
+  {
+    "kind": "APIRoute",
+    "methods": [
       "POST"
     ],
     "name": "admin_set_superadmin",
@@ -2033,6 +2212,166 @@
     ],
     "name": "call_catalog_endpoint",
     "path": "/catalog/call/{rest:path}"
+  },
+  {
+    "kind": "APIRoute",
+    "methods": [
+      "GET",
+      "HEAD"
+    ],
+    "name": "enrich_arena_page",
+    "path": "/enrich-arena"
+  },
+  {
+    "kind": "APIRoute",
+    "methods": [
+      "GET",
+      "HEAD"
+    ],
+    "name": "enrich_arena_page",
+    "path": "/enrich-arena/leaderboard"
+  },
+  {
+    "kind": "APIRoute",
+    "methods": [
+      "GET",
+      "HEAD"
+    ],
+    "name": "enrich_arena_page",
+    "path": "/enrich-arena/people-search-bench"
+  },
+  {
+    "kind": "APIRoute",
+    "methods": [
+      "GET",
+      "HEAD"
+    ],
+    "name": "enrich_arena_asset",
+    "path": "/enrich-arena/{asset}"
+  },
+  {
+    "kind": "APIRoute",
+    "methods": [
+      "GET",
+      "HEAD"
+    ],
+    "name": "arena_tasks",
+    "path": "/arena/tasks"
+  },
+  {
+    "kind": "APIRoute",
+    "methods": [
+      "GET",
+      "HEAD"
+    ],
+    "name": "arena_insights_data",
+    "path": "/arena/insights"
+  },
+  {
+    "kind": "APIRoute",
+    "methods": [
+      "POST"
+    ],
+    "name": "arena_plan",
+    "path": "/arena/plans"
+  },
+  {
+    "kind": "APIRoute",
+    "methods": [
+      "POST"
+    ],
+    "name": "arena_start",
+    "path": "/arena/runs/{run_id}/start"
+  },
+  {
+    "kind": "APIRoute",
+    "methods": [
+      "GET",
+      "HEAD"
+    ],
+    "name": "arena_history",
+    "path": "/arena/runs"
+  },
+  {
+    "kind": "APIRoute",
+    "methods": [
+      "GET",
+      "HEAD"
+    ],
+    "name": "arena_run",
+    "path": "/arena/runs/{run_id}"
+  },
+  {
+    "kind": "APIRoute",
+    "methods": [
+      "POST"
+    ],
+    "name": "arena_cancel",
+    "path": "/arena/runs/{run_id}/cancel"
+  },
+  {
+    "kind": "APIRoute",
+    "methods": [
+      "POST"
+    ],
+    "name": "arena_evaluate",
+    "path": "/arena/runs/{run_id}/evaluations"
+  },
+  {
+    "kind": "APIRoute",
+    "methods": [
+      "POST"
+    ],
+    "name": "arena_reveal",
+    "path": "/arena/runs/{run_id}/reveal"
+  },
+  {
+    "kind": "APIRoute",
+    "methods": [
+      "POST"
+    ],
+    "name": "arena_rate",
+    "path": "/arena/runs/{run_id}/attempts/{attempt_id}/rating"
+  },
+  {
+    "kind": "APIRoute",
+    "methods": [
+      "POST"
+    ],
+    "name": "arena_report",
+    "path": "/arena/runs/{run_id}/attempts/{attempt_id}/report"
+  },
+  {
+    "kind": "APIRoute",
+    "methods": [
+      "POST"
+    ],
+    "name": "arena_manual_plan",
+    "path": "/arena/runs/{run_id}/attempts/{attempt_id}/plan"
+  },
+  {
+    "kind": "APIRoute",
+    "methods": [
+      "POST"
+    ],
+    "name": "arena_manual_start",
+    "path": "/arena/runs/{run_id}/attempts/{attempt_id}/start"
+  },
+  {
+    "kind": "APIRoute",
+    "methods": [
+      "POST"
+    ],
+    "name": "arena_verification_plan",
+    "path": "/arena/runs/{run_id}/attempts/{attempt_id}/verification/plan"
+  },
+  {
+    "kind": "APIRoute",
+    "methods": [
+      "POST"
+    ],
+    "name": "arena_verification_start",
+    "path": "/arena/runs/{run_id}/attempts/{attempt_id}/verification/start"
   },
   {
     "kind": "APIRoute",

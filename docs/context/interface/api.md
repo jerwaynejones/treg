@@ -2,6 +2,7 @@
 title: The API — the only brain (FastAPI)
 status: shipped
 sources:
+  - src/treg/routers/media.py
   - src/treg/web/sitetrack.js
   - src/treg/api.py
   - src/treg/bootstrap_handlers.py
@@ -35,11 +36,13 @@ sources:
   - src/treg/routers/connections.py
   - src/treg/routers/onboard.py
   - src/treg/routers/orgs.py
+  - src/treg/routers/api_keys.py
   - src/treg/routers/resources.py
   - src/treg/routers/referrals.py
   - src/treg/routers/signup_cookies.py
   - src/treg/routers/web.py
   - src/treg/domain/identity/access.py
+  - src/treg/domain/identity/api_keys.py
   - src/treg/domain/governance/teams.py
   - src/treg/domain/governance/access.py
   - src/treg/domain/governance/budgets.py
@@ -61,12 +64,36 @@ related:
 
 # The API
 
+## Managed API keys
+
+`GET/POST /orgs/{id}/api-keys` lists safe metadata or creates an Additional key for the calling
+human. The action routes rename, disable, enable, rotate, revoke, or hide a key according to its
+type and the caller's role. Only creation and permitted rotation return a complete secret, and every
+credential response uses `Cache-Control: no-store`. `GET .../{key_id}/events` returns its audit trail.
+
+A human membership has one signed, team-specific Default key. Rotation increments that row's signed
+generation, so only the prior token for that team stops. Default keys can be disabled or enabled but
+not revoked. Additional and Agent keys are random, hash-stored secrets. Their rotation creates a new
+row and retains the hidden predecessor for audit. Revoking an Agent key removes its machine membership
+and revokes all its keys; revoking a human key does not remove the human membership.
+
+`GET /calls` and `GET /runs` accept `api_key_id` and return the retained key id, name, and safe prefix.
+Billing, balance, and daily-cap checks still use the resolved membership.
+
 ## Feedback
 
 `routers.feedback` owns authenticated `POST /feedback`, team-scoped `GET /feedback/{feedback_id}`,
 and super-admin `GET /admin/feedback`. The intake's transaction belongs to `application.feedback`;
 the routes are in the control role. `routers.web.feedback_md` serves the compact instructions.
 See [feedback](../architecture/feedback.md) for the contract and provenance boundaries.
+
+## Media hosting
+
+`POST /media` (member+, raw body, `Content-Type` = the media type) stores a reference file and
+answers `{url, token, content_type, size, expires_at}`; `GET /m/{token}` serves it publicly, no
+token, because the vendor's fetcher has none. 30 MB per file, 300 MB per org per 24 h, 7-day TTL,
+`image/*` / `audio/*` / `video/*` only, refused in the sandbox. Refusals: 415 type, 413 size, 429
+quota, 403 sandbox. Not metered. See [media](../architecture/media.md).
 
 ## Composition
 
@@ -138,6 +165,12 @@ verified for that), the caller paid the aggregator's real price (`X-Treg-Cost-Mi
 `X-Treg-Call-Id` is the parent call's. Absent on every direct call. Off by default
 (`TREG_OVERFLOW_MODE`). See `architecture/proxy-model.md` § Overflow.
 
+The same fact reaches surfaces that cannot read headers: the MCP `call` result (team and directory
+servers alike) carries `served_via: "overflow:<aggregator>"` and a one-line `hint` naming the relay
+and the exhausted provider, and `GET /catalog/endpoints/{id}` / `catalog_get` carry
+`overflow_price_usd`, `overflow_price_unit` and `overflow_via` on a platform-eligible endpoint the
+deployment can relay - the price a "free" endpoint may actually bill, stated before the call.
+
 ## `X-Treg-Smoothed` - the call waited for treg's own rate limit
 
 On platform calls, including owned free polling: `wait=<ms>` when the call was spaced behind other callers on the
@@ -153,6 +186,16 @@ tell treg's 404 ("no tool registered for that host") from the vendor's own 404: 
 some JSON. The [local proxy](../architecture/local-proxy.md) needs that distinction to explain a failure
 without ever rewriting a real vendor response. `application.call` failures carry a mechanism `kind`
 and separately mapped `blame`; the compatibility header remains the literal `1`.
+
+`routers.auth_helpers.require_managed_cli` also sets `X-Treg-Error: 1` on its HTTP 426
+update response. Released CLIs therefore identify this as a treg refusal instead of a provider
+response. The response remains `Cache-Control: no-store` and precedes any login or team mutation.
+
+`response_buffer_limit` is a treg-attributed 502 with a structured `detail.error` of the same
+name. It means response evidence exceeded the 8 MiB settlement buffer before delivery; the new
+call is not charged and its hold/idempotency claim is released. Authorized free final GET fetches
+needing no body evidence stream without that limit and return zero cost; their retries read the
+provider again. See `proxy-model.md` for the eligibility and close-once lifecycle.
 
 Resolution refusals are actionable: a named miss that resembles one of the caller's usable own tools
 returns a structured `detail` with `hint` and `did_you_mean`, including after a real catalog endpoint
@@ -194,14 +237,17 @@ validated before resolving the shared HTTP client. `/auth/logout` remains an HTT
 
 ## Endpoints
 
-- **Users / orgs:** `register_user` (`POST /users`, open, legacy - used by the test fixture) creates the
-  user + an org + owner membership and returns a token **once**; the dashboard/CLI login doors do NOT go
+- **Users / orgs:** `register_user` (`POST /users`, open, legacy, unverified) creates the
+  user + an org + owner membership with **zero signup credit** and returns a token **once**.
+  Email OTP, Google/GitHub or an inbox-only invite link establishes verification. A new verified
+  account can claim credit once when creating an eligible team; old accounts cannot reclaim it.
+  The dashboard/CLI login doors do NOT go
   through it (they create the user only, no auto org). Both this door and `create_org` read the
   first-party `treg_ad` cookie (`_ad_attribution_from`) and, when conversion tracking is enabled,
   stamp `Org.ad_gclid`/`ad_click_id_type`/`ad_landing`/`ad_click_at` on the new org when present - see
   [ads-conversions](../architecture/ads-conversions.md).
   `create_org` (`POST /orgs`, `require_identity` so a
-  zero-org user can make their first team) + `list_orgs` (`GET /orgs`,
+  zero-org user can make their first team; HTTP 403 when already owning 10 teams) + `list_orgs` (`GET /orgs`,
   each org carries a `tool_count` - one grouped query - so the dashboard can land on the org with tools;
   its `active` flag follows `require_member`'s precedence - per-org membership token, else `X-Treg-Org`,
   else a team-pinned identity token's own `org` claim - so `treg login --token <pinned key>` lands on the
@@ -209,7 +255,7 @@ validated before resolving the shared HTTP client. `/auth/logout` remains an HTT
   invites via `create_invite` (`POST /orgs/{id}/invites`, admin+) → one-time code (**emailed** via
   `email.send_invite`, best-effort, along with a separate inbox-only `email_token` sign-in link - the
   token is never in the JSON response; see the invite sign-in link below), `accept_invite`
-  (`POST /invites/accept`, open) → registers/joins + mints a token. **Code-free invites:** an invite is
+  (`POST /invites/accept`, open) → registers/joins + returns the signed Default token. **Code-free invites:** an invite is
   addressed to an email, so `my_invites` (`GET /invites/mine`, `require_identity`) lists every pending
   invite for the caller's proven email and `accept_my_invite` (`POST /invites/{id}/accept`,
   `require_identity`) accepts one with no code (403 if the invite's email ≠ yours). `list_members` /
@@ -345,7 +391,7 @@ validated before resolving the shared HTTP client. `/auth/logout` remains an HTT
   | `GET /catalog/platforms` | Non-empty platforms with capability/endpoint counts and providers, ordered by endpoint count |
   | `GET /catalog/platforms/{slug}` | Capabilities, extended endpoints, dashboard domain rows and provider metadata; unknown slug is 404 |
   | `GET /catalog/search?q=&limit=` | Ranked endpoint views, count/total and hints; default 25, maximum 100 |
-  | `GET /catalog/endpoints/{id}` | Endpoint, provider, capability siblings, call template, inline example and next-step hints |
+  | `GET /catalog/endpoints/{id}` | Endpoint, provider, capability siblings, call template, inline example and next-step hints; `overflow_price_usd` / `overflow_price_unit` / `overflow_via` on the endpoint when the deployment can relay it |
   | `GET /catalog/examples/{id}` | Captured JSON, resolved through the catalog before constructing a file path |
   | `POST /tool-requests` | Open, rate-limited demand report with capped fields and optional caller attribution |
 
@@ -363,7 +409,12 @@ validated before resolving the shared HTTP client. `/auth/logout` remains an HTT
   disappear from discovery, and return 410 on call/access checks. `platform_blocked` entries
   remain discoverable for BYOK but cannot use treg's key.
 
-  Zero-result searches emit identity-free `SearchMiss` rows through the lossy audit queue.
+  A platform access check normally estimates the default page size. Openmart is the provider-specific
+  exception: its runnable catalog example is priced with the same whole-credit request formula used
+  for reserve, so the pre-call estimate reflects that example's requested record count.
+
+  Zero-result searches emit `SearchMiss` rows through the lossy audit queue. A team-pinned Default
+  token provides the same human and team attribution as an older hash-backed membership token.
   Sources distinguish HTTP, team MCP and the Claude connector. Tool requests may attach a token
   or same-origin session identity; cross-origin cookie submissions remain anonymous.
   `scripts/usage_report.py` reports this unserved demand.
@@ -393,23 +444,29 @@ validated before resolving the shared HTTP client. `/auth/logout` remains an HTT
   offers configured identity doors, then a team picker (including first-team creation).
   `GET /auth/cli/orgs` lists the session user's teams; `POST /auth/cli/approve` requires the
   session, same-origin CSRF check, matching code and membership in the chosen team.
-  Wrong attempts are bounded. `GET /auth/cli/poll` consumes the completed identity token and
-  selected org exactly once. Pairing dictionaries remain process-local.
+  Wrong attempts are bounded. `GET /auth/cli/poll` consumes the selected membership's Default key
+  and org exactly once. When no team was selected, it returns only a seven-day bootstrap credential.
+  Pairing dictionaries remain process-local.
 
   `GET /auth/me` accepts token or session authentication and returns identity/onboarding state.
-  `GET /auth/cli-token` uses `application.auth.issue_cli_token` for optional team pinning.
+  `GET /auth/cli-token` uses `application.auth.issue_cli_token` to return a human membership's
+  team-specific Default key. A bootstrap bearer cannot use this route to mint a team key; the direct
+  email CLI uses its new browser session, and create/join/accept routes return the Default key.
   Typed session credentials require expiry and `aud=session`; copied identity keys use
-  `aud=identity` without expiry. The two audiences are not interchangeable; MCP's internal
-  exchange token is the deliberate 120-second identity exception.
+  `aud=identity` without expiry. Bootstrap credentials also carry `scp=bootstrap` and a seven-day
+  expiry. Default keys carry `scp=team`, an authoritative org, and their generation. The two audiences
+  are not interchangeable; MCP's internal exchange token is the deliberate 120-second identity exception.
 
   Legacy untyped keys with an org claim or without expiry are identity-only. An org-less
   untyped token with expiry remains compatible only until expiry. `token_version` revokes
-  permanent keys; missing `tv` means zero. `POST /auth/revoke-tokens` bumps the version and
+  permanent keys; missing `tv` means zero. New scoped credentials do not change those compatibility
+  rules. `POST /auth/revoke-tokens` bumps the version and
   returns a replacement cookie/token for the caller. `/auth/logout` is a same-origin cookie action.
   Onboarding routes are `POST /onboard/demo|skip|reset`; see [onboarding](onboarding.md).
 
-  The shared dependencies resolve a membership token, identity bearer plus `X-Treg-Org`, or
-  session cookie plus `X-Treg-Org`. Identity and session validation live in
+  The shared dependencies resolve a membership token, a team Default key, a legacy identity bearer
+  plus `X-Treg-Org`, or a session cookie plus `X-Treg-Org`. Bootstrap credentials cannot access team
+  resources even when a caller supplies `X-Treg-Org`. Identity and session validation live in
   `domain.identity.session`; authorization belongs to `domain.identity.access`.
 
 - **Static (dashboard + tutorials):** `dashboard` (`GET /`, `FileResponse` + `Cache-Control: no-cache`),
@@ -525,7 +582,8 @@ validated before resolving the shared HTTP client. `/auth/logout` remains an HTT
     cron remains the fallback. Polling itself is free and does not add Activity entries.
   - `GET /calls/{id}/result` joins the archive hashes to the request shape and stored response.
     `has_result` identifies archived rows; unavailable content returns `stored: false` and a
-    reason (own-key/tool, failure, recording off, expiry or hash-only storage).
+    reason (own tool or an own-key answer over the archive's cap, failure, recording off,
+    expiry or hash-only storage).
     Failure-evidence columns remain excluded. See [archive](../architecture/archive.md).
 
 - **OAuth connect + the provider marketplace:** `oauth_start` (`POST /oauth/start`) creates a
@@ -622,6 +680,13 @@ validated before resolving the shared HTTP client. `/auth/logout` remains an HTT
   `_resolve_call`, so an exact same-named team tool cannot shadow the catalog endpoint. From the
   credential ladder onward it delegates to `call_tool`, retaining provider/user credentials, ACLs,
   deny rules, caps, metering, audit, idempotency and faithful relay.
+
+  The credential ladder also supports a generic `platform_auth: anonymous` catalog fallback. A
+  team tool or provider credential still wins. Without one, a verified free read-only endpoint can
+  relay through a virtual tool with no bindings when its provider is allow-listed. Endpoint access
+  reports `tier: anonymous`, `metered: false`, and zero estimated cost. No platform key is loaded and
+  no team-balance entry is written. The relay preserves caller headers, so a caller-supplied provider
+  key can still be charged by that provider.
 
   A resolved catalog endpoint with an async descriptor adds one treg-owned response header:
   `X-Treg-Async`, containing compact JSON for the already-known effective descriptor. The router
@@ -767,12 +832,14 @@ The response has no id because Starlette owns it, but treg records the row and o
 the handler returns its `StreamingResponse`, are not covered by that compensation path.
 
 A direct metered `/call/` honours **`X-Treg-Route-Max-Cost: <usd>`** as a hard per-call ceiling
-(`service._enforce_caller_max_cost`, 2026-09-05): when the reserve with margin would exceed it the
+(`service._set_caller_max_cost` and `reserve._platform_reserve`): when the reserve with margin would exceed it the
 call is refused **402** `error: route_max_cost` (`max_cost_micro`, `estimated_cost_micro`, no charge,
 audited `refused_by=balance` like every 402) — the same header and body shape the routed path uses,
 so one agent-side handler covers both. Unlike `/do/` there is NO default on a direct call: a caller
 who named the endpoint and page size is uncapped unless they send the header. A non-numeric value is
-a 400. Asked for by a customer whose runner approved $0.23 and was billed $0.56 (2026-09-04).
+a 400. Routed children receive the unspent part of the route ceiling, including the default ceiling;
+this same reservation check also applies to overflow at its own price. Refusing a child cannot
+undo earlier paid attempts. Asked for by a customer whose runner approved $0.23 and was billed $0.56 (2026-09-04).
 
 Metered responses also carry `X-Treg-Cost-Micro`; a reserved call that fails before a provider answer
 carries an explicit `0`. That `0` is what the call ends up costing, but the **balance can lag it**:
@@ -783,9 +850,10 @@ if returning the hold itself fails, the money comes back when the hold is reaped
 |---|---|
 | `GET /calls?days=&before_id=&limit=` | this team's calls, windowed and pageable. Analytics - **not** an invoice source |
 | `GET /calls/{call_ref}` | one call by its `X-Treg-Call-Id`, plus the ledger entries for it and its `async_task` view when it was a metered generation |
-| `GET /calls/{id}/result` | what one call asked and what came back - the archive's copy; metered platform 2xx only, `stored: false` + `note` otherwise |
+| `GET /calls/{id}/result` | what one call asked and what came back - the archive's copy; recorded catalog 2xx only (platform or own key), `stored: false` + `note` otherwise |
 | `GET /orgs/{id}/usage/by-tag?key=&days=` | per-value spend for one tag key. **Money from the ledger**; admin+ |
 | `GET/PUT/DELETE /orgs/{id}/budgets[/{dim}/{val}]` | per-tag limits and blocking; admin+ |
+| `PATCH /orgs/{id}` | (admin+) rename the team: `name` and/or `slug`; the old slug stays an alias so existing keys keep working |
 | `GET/PATCH /orgs/{id}/settings` | the team's daily spend cap, budget dimensions and primary dimension |
 
 `PUT /orgs/{id}/budgets/{dim}/{val}` is an upsert that leaves unsent fields alone - a PUT that only
@@ -835,3 +903,12 @@ make a team. A failed grant recovers by rolling the session back, which expires 
 tracks - so both doors read their response fields *before* granting, and the redemption revives an
 expired `user`/`org` with `db.refresh` before touching them. The recovery path costs the team its
 credit, never the signup response or the referral attribution.
+
+## Optional checkout attribution
+
+`POST /billing/topup` also accepts `checkout_source` alongside `amount_usd`. The dashboard sends
+`arena` for an Arena credit-link arrival and `app` otherwise. The server separately reads the
+first-observed `treg_entry_surface` cookie; both values are normalized to the fixed product-surface
+allowlist (missing or invalid is `unknown`). They travel through Stripe metadata to payment
+analytics and ledger provenance only, never affecting the charged amount or authorization.
+Email OTP and OAuth callbacks read the same cookie for new-account signup analytics after commit.

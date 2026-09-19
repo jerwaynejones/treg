@@ -106,6 +106,21 @@ def test_token_can_carry_an_org_claim_statelessly():
     assert sess.read_identity_claims(good + "x") is None
 
 
+def test_typed_identity_scopes_round_trip_and_bootstrap_expires():
+    bootstrap = sess.read_identity_claims(sess.make_identity(
+        7, ttl=sess.BOOTSTRAP_TTL_SECONDS, scope=sess.BOOTSTRAP_SCOPE,
+    ))
+    assert bootstrap is not None
+    assert bootstrap["scope"] == sess.BOOTSTRAP_SCOPE and bootstrap["exp"] > int(time.time())
+    default = sess.read_identity_claims(sess.make_identity(
+        7, org="acme", key_generation=2, scope=sess.TEAM_SCOPE,
+    ))
+    assert default == {
+        "uid": 7, "tv": 0, "org": "acme", "kg": 2,
+        "aud": sess.IDENTITY_AUDIENCE, "scope": sess.TEAM_SCOPE,
+    }
+
+
 @pytest.fixture
 async def gc(monkeypatch):
     monkeypatch.setenv("TREG_GITHUB_CLIENT_ID", "cid")
@@ -135,6 +150,8 @@ async def test_github_login_creates_user_session_but_no_auto_org(gc):
     # first login creates the USER ONLY — no throwaway personal org; the user names their first team next
     async with session_maker() as s:
         u = (await s.execute(select(User).where(User.email == "octo@example.com"))).scalar_one()
+        assert u.email_verified_at is not None
+        assert u.signup_promo_available
         n = len((await s.execute(select(Membership).where(Membership.user_id == u.id))).scalars().all())
     assert n == 0
 
@@ -177,6 +194,17 @@ async def test_session_scopes_by_x_treg_org(gc):
     assert orgs.status_code == 200 and orgs.json()[0]["slug"] == slug
 
 
+async def test_browser_session_securely_exchanges_for_the_selected_default(gc):
+    uid, _, slug = await _seed(email="exchange@x.dev")
+    gc.cookies.set("treg_session", sess.make_session(uid))
+    minted = await gc.get("/auth/cli-token", headers={"X-Treg-Org": slug})
+    assert minted.status_code == 200, minted.text
+    token = minted.json()["token"]
+    claims = sess.read_identity_claims(token)
+    assert claims["scope"] == sess.TEAM_SCOPE and claims["org"] == slug
+    assert (await gc.get("/tools", headers={"X-Treg-Token": token})).status_code == 200
+
+
 async def test_session_superadmin_reaches_admin(gc):
     uid, _, _ = await _seed(email="root@x.dev", superadmin=True)
     gc.cookies.set("treg_session", sess.make_session(uid))
@@ -187,20 +215,22 @@ async def test_session_superadmin_reaches_admin(gc):
     assert (await gc.get("/admin/stats")).status_code == 403
 
 
-async def test_cli_token_mints_a_usable_identity_token(clients):
-    """GET /auth/cli-token returns a bearer token that actually works (with X-Treg-Org) — this is what
-    the dashboard embeds in its copy-paste snippets + the 'copy token' button."""
+async def test_cli_token_without_a_team_mints_a_restricted_bootstrap(clients):
+    """An org-less login token identifies the account for onboarding, not a billing team."""
     r = await clients.get("/auth/cli-token")
     assert r.status_code == 200, r.text
     tok = r.json()["token"]
-    assert tok and r.json().get("email")
+    claims = sess.read_identity_claims(tok)
+    assert tok and r.json().get("email") and claims["scope"] == sess.BOOTSTRAP_SCOPE
+    assert claims["exp"] > int(time.time())
     slug = (await clients.get("/orgs")).json()[0]["slug"]
-    # the minted identity token authenticates a real call when paired with X-Treg-Org
+    # Supplying a team header cannot turn this onboarding token into a team credential.
     ok = await clients.get("/tools", headers={"X-Treg-Token": tok, "X-Treg-Org": slug})
-    assert ok.status_code == 200, ok.text
-    # ...and without X-Treg-Org it must ask for the org (identity token isn't org-scoped)
-    no_org = await clients.get("/tools", headers={"X-Treg-Token": tok, "X-Treg-Org": ""})
-    assert no_org.status_code == 400
+    assert ok.status_code == 403 and "temporary login token" in ok.json()["detail"]
+    exchange = await clients.get(
+        "/auth/cli-token", headers={"X-Treg-Token": tok, "X-Treg-Org": slug},
+    )
+    assert exchange.status_code == 403
 
 
 async def test_cli_token_requires_auth(clients):
@@ -217,9 +247,19 @@ async def test_cli_token_bakes_the_active_org_and_works_as_a_BARE_bearer(clients
     r = await clients.get("/auth/cli-token", headers={"X-Treg-Org": slug})
     assert r.status_code == 200 and r.json().get("org") == slug, r.text
     baked = r.json()["token"]
+    claims = sess.read_identity_claims(baked)
+    assert claims["scope"] == sess.TEAM_SCOPE and "exp" not in claims
     # the baked token works with NO X-Treg-Org — the org rides on the token
     ok = await clients.get("/tools", headers={"X-Treg-Token": baked, "X-Treg-Org": ""})
     assert ok.status_code == 200, ok.text
+    mismatch = await clients.get(
+        "/tools", headers={"X-Treg-Token": baked, "X-Treg-Org": "another-team"},
+    )
+    assert mismatch.status_code == 403
+    assert mismatch.json()["detail"] == (
+        "this key belongs to another team — use this team's Default key; "
+        "if you use the treg CLI, run `treg update`, then `treg login`"
+    )
 
 
 async def test_orgs_marks_the_team_pinned_tokens_org_active(gc):
@@ -248,9 +288,10 @@ async def test_cli_token_refuses_to_pin_a_team_you_are_not_in(clients):
     else's team yields a plain (unpinned) token, never one that pins a team you cannot reach."""
     r = await clients.get("/auth/cli-token", headers={"X-Treg-Org": "some-other-teams-slug"})
     assert r.status_code == 200 and r.json().get("org") is None, r.text
-    # and the plain token still needs X-Treg-Org, proving it wasn't silently pinned
+    # and the short-lived bootstrap cannot access team resources
     plain = r.json()["token"]
-    assert (await clients.get("/tools", headers={"X-Treg-Token": plain, "X-Treg-Org": ""})).status_code == 400
+    assert sess.read_identity_claims(plain)["scope"] == sess.BOOTSTRAP_SCOPE
+    assert (await clients.get("/tools", headers={"X-Treg-Token": plain})).status_code == 403
 
 
 # ---- Google OAuth (a parallel login door) -------------------------------------------------
@@ -296,6 +337,8 @@ async def test_google_login_creates_user_session_but_no_auto_org(goog):
     assert me.status_code == 200 and me.json()["email"] == "guser@example.com"
     async with session_maker() as s:
         u = (await s.execute(select(User).where(User.email == "guser@example.com"))).scalar_one()
+        assert u.email_verified_at is not None
+        assert u.signup_promo_available
         n = len((await s.execute(select(Membership).where(Membership.user_id == u.id))).scalars().all())
     assert n == 0  # first login registers the user only — no auto personal org
 
@@ -308,3 +351,40 @@ async def test_google_bad_state_rejected(goog):
 
 async def test_meta_exposes_google_flag(goog):
     assert (await goog.get("/meta")).json()["google"] is True
+
+
+async def test_oauth_callback_carries_arena_acquisition_and_counts_signup_once(gc, monkeypatch):
+    from treg import analytics
+    events = []
+    monkeypatch.setattr(analytics, "capture", lambda *a, **k: events.append(a))
+    gc.cookies.set("treg_entry_surface", "arena")
+    for _ in range(2):
+        await gc.get("/auth/github", params={"return_to": "/enrich-arena"})
+        state = gc.cookies.get("treg_oauth_state")
+        r = await gc.get("/auth/github/callback", params={"code": "test", "state": state})
+        assert r.status_code == 302 and r.headers["location"] == "/enrich-arena"
+    signups = [a for a in events if a[1] == "signup_completed"]
+    assert len(signups) == 1
+    assert signups[0][2] == {"signup_method": "github", "entry_surface": "arena"}
+
+
+async def test_oauth_arena_return_cookie_encrypts_and_restores_query(gc):
+    from urllib.parse import urlencode
+
+    target = "/enrich-arena?" + urlencode({
+        "run": "saved-run", "team": "sales; Secure\r\nSet-Cookie: injected=1",
+    })
+    started = await gc.get("/auth/github", params={"return_to": target})
+    cookie = gc.cookies.get("treg_arena_return")
+    assert cookie != target
+    assert crypto.decrypt(cookie) == target
+    assert set(gc.cookies.keys()) == {"treg_oauth_state", "treg_arena_return"}
+    return_header = next(h for h in started.headers.get_list("set-cookie")
+                         if h.startswith("treg_arena_return="))
+    assert "HttpOnly" in return_header and "SameSite=lax" in return_header
+
+    state = gc.cookies.get("treg_oauth_state")
+    response = await gc.get("/auth/github/callback", params={"code": "test", "state": state})
+    assert response.status_code == 302
+    assert response.headers["location"] == target
+    assert gc.cookies.get("treg_arena_return") is None

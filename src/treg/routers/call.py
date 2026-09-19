@@ -29,6 +29,7 @@ from ..application.call.service import (
     create_call_context,
     execute_call,
 )
+from ..application.call.invite import invitation
 from ..application.call.intake import (
     META_HEADER,
     CallMeta,
@@ -230,12 +231,14 @@ async def _stamp_call_exit(
         resp.headers["X-Treg-Cost-Micro"] = str(cost_micro)
     if not getattr(request.state, "call_audited", False):
         org_id, email = getattr(request.state, "call_identity", (None, ""))
+        key_id, key_name, key_prefix = getattr(request.state, "call_key", (None, None, None))
         context = getattr(request.state, "call_context", None)
         rest = _call_rest(request, context)
         audit.record_call(
             org_id=org_id, user_email=email, tool_name=rest.split("/", 1)[0] or "—",
             method=request.method, path=request.url.path, status_code=status_code,
             client=_client_of(request), refused_by=_refusal_kind(status_code),
+            api_key_id=key_id, api_key_name=key_name, api_key_prefix=key_prefix,
             telemetry={"call_ref": call_ref})
         if failure_kind:
             _capture_exceptional_call(
@@ -265,6 +268,17 @@ async def catalog_endpoint_access(
     except CallFailure as exc:
         raise _translate_call_failure(exc) from exc
 
+def _capture_hint(request: Request, context, kind: str) -> None:
+    """One event per invitation actually sent, on every surface: the response-rate denominator.
+    Attachment is not display; the surface's `X-Treg-Client` says who was asked."""
+    marketplace = context.marketplace
+    slug = context.input.caller.org.slug
+    analytics.capture(analytics.SERVER_DISTINCT_ID, "hint_attached", {
+        "kind": kind, "call_id": context.call_ref, "client": _client_of(request),
+        "endpoint_id": marketplace.endpoint_id if marketplace is not None else None,
+    }, groups={"team": slug} if slug else None)
+
+
 @app.api_route(
     "/call/{rest:path}",
     methods=["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"],
@@ -279,6 +293,11 @@ async def call_tool(
     # is the one place every such refusal passes through — but it has no Caller of its own.
     request.state.call_identity = (caller.org_id, caller.email)
     request.state.call_team_slug = caller.org.slug
+    request.state.call_key = (
+        caller.api_key.id if caller.api_key else None,
+        caller.api_key.name if caller.api_key else None,
+        caller.api_key.safe_prefix if caller.api_key else None,
+    )
     # Faithful-relay: use the RAW request path, not Starlette's decoded path param. Decoding is
     # lossy — an encoded slash (`%2f`) in `rest` would become a real `/` and change the upstream
     # route (npm's scoped publish `PUT /@scope%2fname` 404s as `/@scope/name`). httpx preserves
@@ -309,7 +328,19 @@ async def call_tool(
     try:
         upstream = await execute_call(context, request.app.state.http)
         _attach_async_descriptor(upstream, context, rest)
-        return _http_upstream_response(upstream)
+        response = _http_upstream_response(upstream)
+        try:
+            # Optional invitation, decided before the body streams (application/call/invite.py).
+            kind = await invitation(context, response.status_code,
+                                    replayed=bool(response.headers.get("X-Treg-Idempotent-Replay")))
+            if kind is not None:
+                response.headers["X-Treg-Hint"] = kind
+                if kind == "review":
+                    response.headers["X-Treg-Review"] = "requested"  # read by CLI <= 0.18
+                _capture_hint(request, context, kind)
+        except Exception:
+            pass  # A fault here can only lose the header; the answer is already built.
+        return response
     except CallFailure as exc:
         raise _translate_call_failure(exc) from exc
     except PoolTimeoutError:

@@ -30,6 +30,12 @@ related:
 
 # Application composition
 
+The standalone [Enrich Arena](../interface/enrich-arena.md) pages (`/enrich-arena` and
+`/enrich-arena/leaderboard`) and `/arena/*` routes are control-role
+surfaces. Paid interactive runs use the ordinary call application internally. Shutdown drains their
+in-process owners before closing the shared upstream client.
+The shared `/agent-setup.js` browser asset also belongs to the control role.
+
 `bootstrap.create_app(role)` is the FastAPI composition root. `api.py` hosts the ordered route table,
 attaches concern routers at compatibility-sensitive registration points, and calls the factory once at
 EOF so the deployed `treg.api:app` import path remains the default `all` role.
@@ -41,6 +47,12 @@ implied HEAD operations, shared HTTP client creation, startup work, shutdown dra
 conversion worker. Registration order is compatibility behavior. The four stage-0 snapshots stay
 byte-identical for `role="all"` unless that composition intentionally changes.
 
+When archive settings select R2, the lifespan validates object-store configuration before DB
+verification, then owns the asynchronous client until archive and analytics drains finish. This
+conditional resource setup does no object I/O at startup and adds no worker. Tests can supply
+`create_app(..., archive_object_store=...)`; `configure_archive_object_store` is the shared
+in-memory injection seam. See [archive](archive.md) for switches and queue behavior.
+
 For every role, the factory wires the Catalog observation port to one process-local
 `CachedEndpointObservationReader` backed by short `background_session_maker` reads — the cache never
 awaits the source on the request path (a miss returns empty and schedules a refresh), so those
@@ -51,7 +63,10 @@ from app state. This keeps one cache and one refresh Task per
 process even when HTTP and MCP search concurrently. The refresh Task starts lazily on a miss rather
 than appearing in the role's always-running background-task manifest. The lifespan still owns it:
 shutdown first unbinds it from MCP, then calls `aclose()`, which refuses new refreshes and cancels the
-shared Task before database and HTTP resources disappear.
+shared Task before database and HTTP resources disappear. Once the fault handler is installed the
+lifespan emits `analytics.capture_service_started(role)`, one `service_started` event per process
+carrying the `build` and `archive_config` fingerprints every server event has (see
+[data-model](data-model.md#product-analytics-writer-analyticspy)).
 
 `bootstrap_handlers.py` owns the app-wide pool-saturation and HTTP-exception adapters.
 `call_surface.split_call_path`
@@ -136,3 +151,17 @@ otherwise change route inspection and the committed surface snapshot.
 
 Public routes added since: `/{INDEXNOW_KEY}.txt` (`indexnow_key`, `routers/web.py`) — the IndexNow
 key file; listed in the ownership table beside `/sitemap.xml`. See `interface/seo.md` § IndexNow.
+
+No web process collects Arena statistics any more: `treg-worker arena insights` (a cron) does,
+and `/arena/insights`, a control route, only reads the last published snapshot. `ROLE_BACKGROUND_TASKS`
+therefore lists `adsconv.worker` alone for control/all.
+Shutdown cancels and awaits every started background worker before draining Arena, audit and
+analytics or closing the shared client, so database rollback/close finishes before event-loop teardown.
+
+`POST /reviews` and `GET /admin/reviews` belong to control, alongside feedback intake and reads,
+as do `POST /media` and the public `GET /m/{token}` that serves a hosted reference file.
+
+The archive object-store lifespan normalizes configuration once, chooses an R2 factory or
+injected in-memory context, and resets the store on exit. R2 validation runs before DB startup
+verification; an obsolete comparison-mode environment variable no longer blocks migration CLI
+settings construction.

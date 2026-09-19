@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 
-from treg import bootstrap
+from treg import archive, archive_bodies, bootstrap
 from treg.application import billing
 from treg.application.call import authorize, overflow, reserve, service, settle
 from treg.domain import money
@@ -20,6 +20,13 @@ from treg.domain.governance import usage as usage_policy
 _SRC = Path(__file__).parents[1] / "src" / "treg"
 
 _DATAPLANE_DERIVED_WRITES = {
+    # Body objects preserve the paid response. Upload completes before the archive DB transaction
+    # starts, and only its verified content hash can be published on the snapshot.
+    "archive_body_object": (
+        (service._execute_call, "archive.record"),
+        (archive._store, "archive_bodies.prepare"),
+        (archive_bodies.prepare, "_store.put"),
+    ),
     "auto_topup_task": (
         (reserve._platform_reserve, "billing.maybe_schedule_autotopup"),
         (billing.maybe_schedule_autotopup, "loop.create_task"),
@@ -55,6 +62,12 @@ _DATAPLANE_DERIVED_WRITES = {
         (overflow._finish_budget, "overflow_spend_ledger.add_in_transaction"),
         (overflow._preserve_unknown_budget, "overflow_spend_ledger.add_in_transaction"),
     ),
+    # The repeat-hit price needs to know whether a team has paid for a question before: the
+    # metered settle marks (org, key) in the SAME transaction as the charge, so the mark lands
+    # with the money or not at all.
+    "archive_org_use_in_settle": (
+        (settle._platform_settle, "archive.note_org_use_in_transaction"),
+    ),
     "overflow_budget_reservation": (
         (overflow._maybe_overflow_attempt, "overflow_spend_ledger.reserve_in_transaction"),
         (overflow._release_budget, "overflow_spend_ledger.release_reservation_in_transaction"),
@@ -73,6 +86,7 @@ _DATAPLANE_DERIVED_WRITES = {
     ),
 }
 _EXPECTED_DATAPLANE_WRITES = frozenset({
+    "archive_body_object",
     "auto_topup_task",
     "public_demo_ratestore_hit",
     "sandbox_ratestore_hit",
@@ -80,12 +94,15 @@ _EXPECTED_DATAPLANE_WRITES = frozenset({
     "lazy_stale_hold_reap",
     "capacity_exhausted_mark",
     "overflow_spend_in_settle",
+    "archive_org_use_in_settle",
     "overflow_budget_reservation",
     "async_result_ownership",
     "async_resource_ownership",
     "member_daily_cap_slot",
 })
 _DERIVED_WRITE_FILES = {
+    _SRC / "archive.py": {"archive_bodies.prepare"},
+    _SRC / "archive_bodies.py": {"_store.put"},
     _SRC / "application" / "billing.py": {"loop.create_task"},
     _SRC / "application" / "call" / "authorize.py": {
         "publicdemo_policy.enforce_public_demo_ip_cap", "usage_policy.enforce_daily_cap",
@@ -94,7 +111,7 @@ _DERIVED_WRITE_FILES = {
     _SRC / "application" / "call" / "reserve.py": {"billing.maybe_schedule_autotopup"},
     _SRC / "application" / "call" / "settle.py": {
         "adsconv.queue", "capacity_marks.strike", "capacity_marks.clear",
-        "overflow_spend_ledger.add_in_transaction",
+        "overflow_spend_ledger.add_in_transaction", "archive.note_org_use_in_transaction",
     },
     _SRC / "application" / "call" / "overflow.py": {
         "capacity_marks.strike", "overflow_spend_ledger.add_in_transaction",
@@ -102,6 +119,7 @@ _DERIVED_WRITE_FILES = {
         "overflow_spend_ledger.release_reservation_in_transaction",
     },
     _SRC / "application" / "call" / "service.py": {
+        "archive.record",
         "async_task_app.observe_owned_poll",
         "async_task_app.remember_platform_resources",
     },
@@ -112,6 +130,9 @@ _DERIVED_WRITE_FILES = {
     _SRC / "domain" / "money" / "__init__.py": {"reap_stale_holds", "release"},
 }
 _EXPECTED_DERIVED_WRITE_SITES = {
+    ("application/call/service.py", "_execute_call", "archive.record"),
+    ("archive.py", "_store", "archive_bodies.prepare"),
+    ("archive_bodies.py", "prepare", "_store.put"),
     ("application/billing.py", "maybe_schedule_autotopup", "loop.create_task"),
     ("application/call/authorize.py", "authorize_call",
      "publicdemo_policy.enforce_public_demo_ip_cap"),
@@ -126,6 +147,8 @@ _EXPECTED_DERIVED_WRITE_SITES = {
     ("application/call/settle.py", "_note_capacity_recovery", "capacity_marks.clear"),
     ("application/call/settle.py", "_platform_settle", "overflow_spend_ledger.add_in_transaction"),
     ("application/call/settle.py", "_close", "overflow_spend_ledger.add_in_transaction"),
+    ("application/call/settle.py", "_platform_settle", "archive.note_org_use_in_transaction"),
+    ("application/call/settle.py", "_close", "archive.note_org_use_in_transaction"),
     ("application/call/overflow.py", "_maybe_overflow_attempt", "capacity_marks.strike"),
     ("application/call/overflow.py", "_record_shadow", "overflow_spend_ledger.add_in_transaction"),
     ("application/call/overflow.py", "_finish_budget", "overflow_spend_ledger.add_in_transaction"),
